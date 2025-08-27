@@ -45,6 +45,16 @@ app.get('/tiktok-sse', async (req, res) => {
     if (tiktok) { try { tiktok.disconnect(); } catch {} tiktok = null; }
 
     writeEvent('debug', { stage: 'attempt', user, trigger });
+	
+	  // Add this helper to serialize errors clearly
+  function errPayload(e) {
+    if (!e) return { message: 'unknown' };
+    const out = { message: e.message || String(e) };
+    if (e.code) out.code = e.code;
+    if (e.statusCode) out.statusCode = e.statusCode;
+    if (e.status) out.status = e.status;
+    return out;
+  }
 
     tiktok = new WebcastPushConnection(user, { // public data only
       enableExtendedGiftInfo: false
@@ -60,25 +70,24 @@ app.get('/tiktok-sse', async (req, res) => {
       });
     });
 
-    // reconnect cases
-const onDisc = () => { writeEvent('status', { state: 'disconnected' }); schedule('disconnected'); };
-const onErr  = (e) => { writeEvent('status', { state: 'error', error: String(e||'') }); schedule('error'); };
-const onEnd  = () => { writeEvent('status', { state: 'ended' }); schedule('streamEnd'); };
-tiktok.on('disconnected', onDisc);
-tiktok.on('error', onErr);
-tiktok.on('streamEnd', onEnd);
-
+    // reconnect cases — include details so the client can display them
+    const onDisc = () => { writeEvent('status', { state: 'disconnected' }); schedule('disconnected'); };
+    const onErr  = (e) => { writeEvent('status', { state: 'error', ...errPayload(e) }); schedule('error'); };
+    const onEnd  = () => { writeEvent('status', { state: 'ended' }); schedule('streamEnd'); };
+    tiktok.on('disconnected', onDisc);
+    tiktok.on('error', onErr);
+    tiktok.on('streamEnd', onEnd);
 
     try {
       await tiktok.connect();
       attempt = 0; // reset backoff
+	  writeEvent('status', { state: 'connected', user });
       writeEvent('open', { ok: true, user });
-    } catch (e) {
+       } catch (e) {
+      writeEvent('status', { state: 'error', ...errPayload(e) });
       schedule('connect:reject');
     }
   }
-  
-  writeEvent('status', { state: 'connected', user });
 
   function schedule(reason) {
     if (closed) return;
