@@ -6,10 +6,11 @@
   "engines": { "node": ">=18" },
   "dependencies": {
     "express": "^4.19.2",
-    "tiktok-live-connector": "^1.9.0"
+    "tiktok-live-connector": "1.8.7"
   },
   "scripts": {
     "start": "node server.js"
   }
 }
+
 
