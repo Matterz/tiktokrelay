@@ -34,43 +34,63 @@ function isYouTubeUrl(u) {
 
 /* ----------------------- Twitch followers-based pick ---------------------- */
 /**
- * From a markdown-ish blob, find the paragraph immediately AFTER a line that
- * contains something like "9.4M followers", i.e. between the next two blank lines.
+ * From a markdown-ish blob, find the first sentence-like paragraph that follows
+ * the line containing something like "9.4M followers". Skip CTAs like "Follow".
  */
 function extractTwitchBylineAfterFollowers(markdown) {
   const txt = unwrapJina(markdown);
   if (!txt) return '';
 
+  // Split into paragraphs by blank lines
   const paras = txt
     .split(/\n{2,}/)
-    .map(p => p.trim())
+    .map((p) => p.trim())
     .filter(Boolean);
 
-  // Examples: "9.4M followers", "9,400,000 followers", "9400 followers", "9.4 million followers"
+  // Followers regex examples: "9.4M followers", "9,400,000 followers", "9400 followers", "9.4 million followers"
   const FOLLOWERS_RE = /\b\d[\d.,]*\s*(?:[kmb]|thousand|million|billion)?\s*followers\b/i;
 
-  for (let i = 0; i < paras.length - 1; i++) {
+  // Find followers index
+  let idx = -1;
+  for (let i = 0; i < paras.length; i++) {
     const p = paras[i];
-    if (FOLLOWERS_RE.test(p) || /\bfollowers\b/i.test(p)) {
-      let next = paras[i + 1] || '';
-      // Avoid common Twitch chat banner
-      if (/welcome to the chat room!/i.test(next)) continue;
-      // Remove markdown links and collapse spaces
-      next = next.replace(/\[[^\]]*\]\([^)]*\)/g, ' ')
-                 .replace(/\s+/g, ' ')
-                 .trim();
-      if (next) return clamp100(next);
+    if (FOLLOWERS_RE.test(p) || /\bfollowers\b/i.test(p)) { idx = i; break; }
+  }
+  if (idx === -1) return '';
+
+  const BAD_CTA = /^(follow|following|subscribe|subscribed|gift a sub|gift sub|report|share|chat|send a message|emote[- ]?only|shop|store|block)$/i;
+  const BAD_PHRASE = /welcome to the chat room!/i;
+  const OK_KEY = /\b(streams?|streaming|gaming|plays?|about|bio|welcome|business|contact|creator|videos?)\b/i;
+
+  // Look ahead up to 5 paragraphs for a good candidate
+  for (let j = idx + 1; j < Math.min(paras.length, idx + 6); j++) {
+    let cand = paras[j]
+      .replace(/\[[^\]]*\]\([^)]*\)/g, ' ') // strip markdown links
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!cand) continue;
+    if (BAD_PHRASE.test(cand)) continue;
+    if (BAD_CTA.test(cand)) continue;
+
+    const words = cand.split(/\s+/);
+    // Skip very short CTAs that slipped through (1–2 words, no sentence punctuation)
+    if (words.length <= 2 && !/[.!?]$/.test(cand)) continue;
+
+    // Accept if it's a sentence or contains good keywords
+    if (/[.!?]["']?$/.test(cand) || OK_KEY.test(cand)) {
+      return clamp100(cand);
     }
   }
+
   return '';
 }
 
 /* ------------------------------- BYLINE API ------------------------------ */
 /**
  * GET /byline?u=<absolute URL>
- * - For Twitch: pick the paragraph after the "<count> followers" line.
- * - For others: (unchanged behavior) — return a short line based on your previous logic
- *   if you had one; here we just return the first 100 chars of the readable text.
+ * - For Twitch: pick the paragraph after the "<count> followers" line, skipping CTAs.
+ * - For others: return a concise slice of the readable text (unchanged).
  */
 app.get('/byline', async (req, res) => {
   try {
