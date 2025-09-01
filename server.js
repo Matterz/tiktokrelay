@@ -50,14 +50,36 @@ function clamp100(s){
   return t.slice(0, 100).replace(/\s+\S*$/, '') + '…';
 }
 
+// Dedupe immediate repeated sentences (e.g., "Hi! ... Hi! ...")
+function dedupeSentences(s){
+  const parts = String(s || '').split(/([.!?]["']?\s+)/); // keep sentence separators
+  if (parts.length <= 1) return String(s || '').trim();
+
+  const out = [];
+  for (let i = 0; i < parts.length; i += 2) {
+    const sentence = (parts[i] || '').trim();
+    const sep = parts[i + 1] || '';
+    if (!sentence) continue;
+
+    const prev = out.length ? out[out.length - 1].s : null;
+    if (prev && prev.toLowerCase() === sentence.toLowerCase()) {
+      // skip exact repeat
+      continue;
+    }
+    out.push({ s: sentence, sep });
+  }
+  return out.map(x => x.s + x.sep).join('').trim();
+}
+
 // --- Platform-aware extraction ----------------------------------------------
 function extractYouTubeMainByline(markdown, sourceUrl){
   const txt = unwrapJina(markdown);
 
-  // Find the text right AFTER the "X subscribers • Y videos" line
+  // Grab the text immediately AFTER "… subscribers • … videos"
   const m = txt.match(/\bsubscribers\b[^\n]{0,200}?\bvideos\b\s*([^\n]{8,600})/i);
   if (!m || !m[1]) return '';
 
+  // Clean junk/links first
   let body = stripLinksAndJunk(m[1]);
 
   // Redact channel handle/name derived from URL
@@ -72,7 +94,16 @@ function extractYouTubeMainByline(markdown, sourceUrl){
     }
   } catch {}
 
+  // Some scrapes echo the first sentence twice; collapse that.
+  //  - Start-of-string duplicate collapse
+  body = body.replace(/^(.{8,160}?)(?:\s+\1)+/i, '$1');
+  //  - Sentence-level dedupe
+  body = dedupeSentences(body);
+
+  // Final tidy (also collapses any lingering “more” we missed)
   body = dedupeHead(body);
+
+  // Show a concise hint (100 chars)
   return clamp100(body);
 }
 
