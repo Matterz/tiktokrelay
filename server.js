@@ -310,6 +310,96 @@ app.get('/tiktok-sse', async (req, res) => {
   connect('init');
 });
 
+// --- Twitch-only helpers for full About page proxy ---
+
+// Is this a Twitch URL?
+function isTwitchUrl(u) {
+  return /(^|\/\/)(www\.)?twitch\.tv\//i.test(String(u));
+}
+
+// Normalize to https://twitch.tv/<user>/about
+function normalizeTwitchAboutUrl(raw) {
+  const u = String(raw || '').trim();
+  try {
+    const url = new URL(u);
+    const user = (url.pathname.split('/').filter(Boolean)[0] || '').replace(/^@/, '');
+    return user ? `${url.origin}/${user}/about` : `${url.origin}/about`;
+  } catch {
+    return u.replace(/\/+$/, '') + '/about';
+  }
+}
+
+// 12s abort helper
+function timeoutSignal(ms = 12000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  return { signal: ctrl.signal, cancel: () => clearTimeout(t) };
+}
+
+// Pull out the "Markdown Content:" part from r.jina.ai (if present)
+function extractMarkdownSection(rawText) {
+  const txt = String(rawText || '');
+  const i = txt.toLowerCase().indexOf('markdown content:');
+  return i >= 0 ? txt.slice(i + 'markdown content:'.length).trim() : txt.trim();
+}
+
+// Light structure for convenience (you can ignore this client-side if you want)
+function structureMarkdown(md) {
+  const lines = md.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  const headings = lines.filter((l) => /^#{1,6}\s+\S/.test(l));
+  return { headings, lines };
+}
+
+// GET /twitch-about?u=<twitch-channel-url>
+// Returns JSON: { sourceUrl, format: "markdown", markdown, headings[], lines[] }
+app.get('/twitch-about', async (req, res) => {
+  try {
+    const rawU = String(req.query.u || '').trim();
+    if (!rawU || !isTwitchUrl(rawU)) {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      return res.status(400).json({ error: 'Provide ?u= with a twitch.tv URL' });
+    }
+
+    const sourceUrl = normalizeTwitchAboutUrl(rawU);
+    const jinaUrl = 'https://r.jina.ai/http://' + sourceUrl.replace(/^https?:\/\//i, '');
+
+    const { signal, cancel } = timeoutSignal(12000);
+    const r = await fetch(jinaUrl, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; RelayBot/1.0)',
+        'Accept': 'text/plain,*/*;q=0.8'
+      },
+      redirect: 'follow',
+      signal
+    }).catch((e) => ({ ok: false, status: 599, _err: e }));
+    cancel();
+
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    if (!r || !r.ok) {
+      return res.status(502).json({ error: 'upstream_unavailable', status: r && r.status });
+    }
+
+    const rawText = await r.text();
+    const markdown = extractMarkdownSection(rawText);
+    const { headings, lines } = structureMarkdown(markdown);
+
+    return res.status(200).json({
+      sourceUrl,
+      fetchedFrom: 'jina',
+      format: 'markdown',
+      markdown,
+      headings,
+      lines,
+      fetchedAt: new Date().toISOString()
+    });
+  } catch (e) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    return res.status(200).json({ sourceUrl: null, format: 'markdown', markdown: '' }); // fail-soft
+  }
+});
+
 /* --------------------------------- Start -------------------------------- */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Relay listening on', PORT));
