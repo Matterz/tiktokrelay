@@ -2,9 +2,167 @@
 const express = require('express');
 const { WebcastPushConnection } = require('tiktok-live-connector');
 
+// If you're on Node < 18, uncomment the next line and add `node-fetch` to deps.
+// const fetch = (...args) => import('node-fetch').then(m => m.default(...args));
+
 const app = express();
 
+// --- Byline helpers ---------------------------------------------------------
+function escRe(s){ return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+function unwrapJina(md){
+  if (!md) return '';
+  let t = String(md).replace(/\r\n/g, '\n');
+  const i = t.toLowerCase().indexOf('markdown content:');
+  return i !== -1 ? t.slice(i + 'markdown content:'.length) : t;
+}
+function stripLinksAndJunk(s){
+  return String(s)
+    // remove "...more" and "…more"
+    .replace(/(?:\.{3}|…)\s*more/gi, ' ')
+    // strip markdown links completely → ****
+    .replace(/\[[^\]]*?\]\([^)]+?\)/g, '****')
+    // strip bare URLs → ****
+    .replace(/\b(?:https?:\/\/|www\.)[^\s)]+/gi, '****')
+    // drop bracketed/braced fragments
+    .replace(/[\[\]{}]/g, ' ')
+    // drop "and N more links"
+    .replace(/\band\s+\d+\s+more\s+links?\b/gi, ' ')
+    // collapse whitespace
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+function dedupeHead(s){
+  // If the first ~40 chars repeat immediately (common on some YT scrapes), keep one.
+  const txt = String(s).trim();
+  if (txt.length < 30) return txt;
+  for (let n = 40; n >= 20; n--) {
+    const a = txt.slice(0, n);
+    const b = txt.slice(n, n*2);
+    if (a && b && b.startsWith(a)) return (a + txt.slice(n*2)).trim();
+  }
+  return txt;
+}
+function clamp100(s){
+  const t = String(s).trim();
+  if (t.length <= 100) return t;
+  return t.slice(0, 100).replace(/\s+\S*$/, '') + '…';
+}
+
+// Dedupe immediate repeated sentences (e.g., "Hi! ... Hi! ...")
+function dedupeSentences(s){
+  const parts = String(s || '').split(/([.!?]["']?\s+)/); // keep sentence separators
+  if (parts.length <= 1) return String(s || '').trim();
+
+  const out = [];
+  for (let i = 0; i < parts.length; i += 2) {
+    const sentence = (parts[i] || '').trim();
+    const sep = parts[i + 1] || '';
+    if (!sentence) continue;
+
+    const prev = out.length ? out[out.length - 1].s : null;
+    if (prev && prev.toLowerCase() === sentence.toLowerCase()) {
+      // skip exact repeat
+      continue;
+    }
+    out.push({ s: sentence, sep });
+  }
+  return out.map(x => x.s + x.sep).join('').trim();
+}
+
+// --- Platform-aware extraction ----------------------------------------------
+function extractYouTubeMainByline(markdown, sourceUrl){
+  const txt = unwrapJina(markdown);
+
+  // Grab the text immediately AFTER "… subscribers • … videos"
+  const m = txt.match(/\bsubscribers\b[^\n]{0,200}?\bvideos\b\s*([^\n]{8,600})/i);
+  if (!m || !m[1]) return '';
+
+  // Clean junk/links first
+  let body = stripLinksAndJunk(m[1]);
+
+  // Redact channel handle/name derived from URL
+  try {
+    const handleFromAt = (sourceUrl.match(/youtube\.com\/@([^/?#]+)/i) || [])[1];
+    const handleFromUC = (sourceUrl.match(/youtube\.com\/channel\/(UC[0-9A-Za-z_-]{22})/i) || [])[1];
+    const h = handleFromAt || handleFromUC || '';
+    if (h) {
+      body = body
+        .replace(new RegExp('\\b' + escRe(h) + '\\b', 'gi'), '****')
+        .replace(new RegExp('\\b' + escRe(h.replace(/^@+/, '')) + '\\b', 'gi'), '****');
+    }
+  } catch {}
+
+  // Some scrapes echo the first sentence twice; collapse that.
+  //  - Start-of-string duplicate collapse
+  body = body.replace(/^(.{8,160}?)(?:\s+\1)+/i, '$1');
+  //  - Sentence-level dedupe
+  body = dedupeSentences(body);
+
+  // Final tidy (also collapses any lingering “more” we missed)
+  body = dedupeHead(body);
+
+  // Show a concise hint (100 chars)
+  return clamp100(body);
+}
+
+
+function extractTwitchAboutByline(markdown){
+  const txt = unwrapJina(markdown);
+  // Split on paragraphs; score for human-ish "About me" text; avoid cookie/legal blobs
+  const BAD = /\b(cookie|cookies|consent|advertis|privacy|policy|analytics|partners|third[- ]party|marketing|targeting|gdpr|do not sell)\b/i;
+  const paras = txt.split(/\n{2,}/)
+    .map(p => p.split('\n').map(s => s.trim()).filter(Boolean).join(' '))
+    .map(stripLinksAndJunk)
+    .filter(Boolean)
+    .filter(p => !BAD.test(p));
+
+  let best = '';
+  let bestScore = -1;
+  for (const p of paras) {
+    const s =
+      (p.length >= 40 && p.length <= 400 ? 60 : 0) +
+      (/[.!?]["']?$/.test(p) ? 10 : 0) +
+      (/\b(i|my|me|we|stream|streaming|live|gaming|videos?|subscribe|follow|community|thank you)\b/i.test(p) ? 25 : 0) +
+      (/\babout\b/i.test(p) ? 10 : 0);
+    if (s > bestScore) { bestScore = s; best = p; }
+  }
+  return clamp100(best);
+}
+
+function extractGenericByline(markdown){
+  const txt = unwrapJina(markdown);
+  const NAV = /^(home|videos|shorts|live|playlists|community|channels|store|members|about|description|search|subscriptions|popular|stats|links?|details?|location|joined|business|email|contact|creator|more)$/i;
+  const BAD = /\b(cookie|cookies|consent|privacy|policy|analytics|partners|third[- ]party|marketing|targeting)\b/i;
+
+  const paras = txt.split(/\n{2,}/)
+    .map(p => p.split('\n').map(s => s.trim()).filter(Boolean).filter(l => !NAV.test(l)).join(' '))
+    .map(stripLinksAndJunk)
+    .filter(Boolean)
+    .filter(p => !BAD.test(p));
+
+  let best = '';
+  let score = -1;
+  for (const p of paras) {
+    const s =
+      (p.length >= 40 && p.length <= 400 ? 60 : 0) +
+      (/[.!?]["']?$/.test(p) ? 10 : 0) +
+      (/\b(i|my|we|channel|subscribe|video|videos|stream|streaming|gaming|variety)\b/i.test(p) ? 20 : 0);
+    if (s > score) { score = s; best = p; }
+  }
+  return clamp100(best);
+}
+
+function extractBylineFor(url, markdown){
+  const u = String(url || '').toLowerCase();
+  if (/youtube\.com/.test(u))   return extractYouTubeMainByline(markdown, url);
+  if (/twitch\.tv/.test(u))     return extractTwitchAboutByline(markdown);
+  return extractGenericByline(markdown);
+}
+
 /* ----------------------------- CORS (global) ----------------------------- */
+/* Allow the browser to call these endpoints from any origin (Bluehost, etc.) */
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET,OPTIONS');
@@ -13,92 +171,34 @@ app.use((req, res, next) => {
   next();
 });
 
-/* ------------------------------ Small utils ------------------------------ */
-function unwrapJina(md) {
-  if (!md) return '';
-  let t = String(md).replace(/\r\n/g, '\n');
-  const i = t.toLowerCase().indexOf('markdown content:');
-  return i !== -1 ? t.slice(i + 'markdown content:'.length) : t;
-}
-function clamp100(s) {
-  const t = String(s).trim();
-  if (t.length <= 100) return t;
-  return t.slice(0, 100).replace(/\s+\S*$/, '') + '…';
-}
-function isTwitchUrl(u) {
-  return /(^|\/\/)(www\.)?twitch\.tv\//i.test(String(u));
-}
-function isYouTubeUrl(u) {
-  return /(^|\/\/)(www\.)?youtube\.com\//i.test(String(u));
-}
-
-/* ----------------------- Twitch followers-based pick ---------------------- */
-/**
- * From a markdown-ish blob, find the first sentence-like paragraph that follows
- * the line containing something like "9.4M followers". Skip CTAs like "Follow".
- */
-function extractTwitchBylineAfterFollowers(markdown) {
-  const txt = unwrapJina(markdown);
-  if (!txt) return '';
-
-  // Split into paragraphs by blank lines
-  const paras = txt
-    .split(/\n{2,}/)
-    .map((p) => p.trim())
-    .filter(Boolean);
-
-  // Followers regex examples: "9.4M followers", "9,400,000 followers", "9400 followers", "9.4 million followers"
-  const FOLLOWERS_RE = /\b\d[\d.,]*\s*(?:[kmb]|thousand|million|billion)?\s*followers\b/i;
-
-  // Find followers index
-  let idx = -1;
-  for (let i = 0; i < paras.length; i++) {
-    const p = paras[i];
-    if (FOLLOWERS_RE.test(p) || /\bfollowers\b/i.test(p)) { idx = i; break; }
-  }
-  if (idx === -1) return '';
-
-  const BAD_CTA = /^(follow|following|subscribe|subscribed|gift a sub|gift sub|report|share|chat|send a message|emote[- ]?only|shop|store|block)$/i;
-  const BAD_PHRASE = /welcome to the chat room!/i;
-  const OK_KEY = /\b(streams?|streaming|gaming|plays?|about|bio|welcome|business|contact|creator|videos?)\b/i;
-
-  // Look ahead up to 5 paragraphs for a good candidate
-  for (let j = idx + 1; j < Math.min(paras.length, idx + 6); j++) {
-    let cand = paras[j]
-      .replace(/\[[^\]]*\]\([^)]*\)/g, ' ') // strip markdown links
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    if (!cand) continue;
-    if (BAD_PHRASE.test(cand)) continue;
-    if (BAD_CTA.test(cand)) continue;
-
-    const words = cand.split(/\s+/);
-    // Skip very short CTAs that slipped through (1–2 words, no sentence punctuation)
-    if (words.length <= 2 && !/[.!?]$/.test(cand)) continue;
-
-    // Accept if it's a sentence or contains good keywords
-    if (/[.!?]["']?$/.test(cand) || OK_KEY.test(cand)) {
-      return clamp100(cand);
-    }
-  }
-
-  return '';
-}
+/* ------------------------------ Healthcheck ------------------------------ */
+app.get('/', (_req, res) => res.type('text/plain').send('TikTok SSE relay & Byline proxy OK'));
 
 /* ------------------------------- BYLINE API ------------------------------ */
 /**
  * GET /byline?u=<absolute URL>
- * - For Twitch: pick the paragraph after the "<count> followers" line, skipping CTAs.
- * - For others: return a concise slice of the readable text (unchanged).
+ * - No fallback attempts. We fetch Jina's textified mirror exactly once.
+ * - On success: 200 text/plain (raw text body from Jina).
+ * - On any failure: 4xx/5xx JSON; client should treat as "hint unavailable".
  */
+// --- Byline proxy: YT uses MAIN page; sanitize; single attempt; no client fallback ------
 app.get('/byline', async (req, res) => {
   try {
-    const rawUrl = String(req.query.u || '').trim();
+    let rawUrl = String(req.query.u || '').trim();
     if (!rawUrl) return res.status(400).type('text/plain').send('Missing u');
 
+    // Allow only known platforms
+    const ok = /^(https?:)?\/\/(?:www\.)?(youtube\.com|twitch\.tv|kick\.com)\b/i.test(rawUrl);
+    if (!ok) return res.status(400).type('text/plain').send('Unsupported host');
+
+    // For YouTube: force the MAIN channel page (strip any trailing /about)
+    if (/youtube\.com/i.test(rawUrl)) {
+      rawUrl = rawUrl.replace(/\/about(?:$|[/?#].*)/i, '');
+    }
+
+    // Build Jina fetch (textified mirror)
     const target = rawUrl.replace(/^https?:\/\//i, '');
-    const jina = 'https://r.jina.ai/http://' + target;
+    const jina   = 'https://r.jina.ai/http://' + target;
 
     const r = await fetch(jina, {
       method: 'GET',
@@ -109,31 +209,16 @@ app.get('/byline', async (req, res) => {
     if (!r.ok) return res.status(502).type('text/plain').send('Fetch failed');
 
     const md = await r.text();
+    const byline = extractBylineFor(rawUrl, md);
 
-    if (isTwitchUrl(rawUrl)) {
-      const picked = extractTwitchBylineAfterFollowers(md);
-      if (picked) {
-        res.set('Cache-Control', 'public, max-age=1800');
-        return res.type('text/plain').send(picked);
-      }
-      // If not found for Twitch, return empty (client can fall back or ignore)
-      return res.status(204).end();
-    }
-
-    // For non-Twitch, leave existing clients unaffected: return a concise slice of readable text.
-    const text = unwrapJina(md).split(/\n{2,}/).map(s => s.trim()).filter(Boolean)[0] || '';
-    const out = clamp100(text);
-    if (!out) return res.status(204).end();
-    res.set('Cache-Control', 'public, max-age=1800');
-    return res.type('text/plain').send(out);
+    if (!byline) return res.status(204).end(); // empty → client shows “unavailable this round”
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.type('text/plain').send(byline);
   } catch (e) {
     console.error('byline error:', e && e.message ? e.message : e);
-    return res.status(503).type('text/plain').send('Unavailable');
+    res.status(503).type('text/plain').send('Unavailable');
   }
 });
-
-/* ------------------------------ Healthcheck ------------------------------ */
-app.get('/', (_req, res) => res.type('text/plain').send('TikTok SSE relay & Byline proxy OK'));
 
 /* ------------------------------ TikTok SSE ------------------------------- */
 /** SSE endpoint: /tiktok-sse?user=keyaogames */
@@ -223,6 +308,96 @@ app.get('/tiktok-sse', async (req, res) => {
   }
 
   connect('init');
+});
+
+// --- Twitch-only helpers for full About page proxy ---
+
+// Is this a Twitch URL?
+function isTwitchUrl(u) {
+  return /(^|\/\/)(www\.)?twitch\.tv\//i.test(String(u));
+}
+
+// Normalize to https://twitch.tv/<user>/about
+function normalizeTwitchAboutUrl(raw) {
+  const u = String(raw || '').trim();
+  try {
+    const url = new URL(u);
+    const user = (url.pathname.split('/').filter(Boolean)[0] || '').replace(/^@/, '');
+    return user ? `${url.origin}/${user}/about` : `${url.origin}/about`;
+  } catch {
+    return u.replace(/\/+$/, '') + '/about';
+  }
+}
+
+// 12s abort helper
+function timeoutSignal(ms = 12000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  return { signal: ctrl.signal, cancel: () => clearTimeout(t) };
+}
+
+// Pull out the "Markdown Content:" part from r.jina.ai (if present)
+function extractMarkdownSection(rawText) {
+  const txt = String(rawText || '');
+  const i = txt.toLowerCase().indexOf('markdown content:');
+  return i >= 0 ? txt.slice(i + 'markdown content:'.length).trim() : txt.trim();
+}
+
+// Light structure for convenience (you can ignore this client-side if you want)
+function structureMarkdown(md) {
+  const lines = md.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  const headings = lines.filter((l) => /^#{1,6}\s+\S/.test(l));
+  return { headings, lines };
+}
+
+// GET /twitch-about?u=<twitch-channel-url>
+// Returns JSON: { sourceUrl, format: "markdown", markdown, headings[], lines[] }
+app.get('/twitch-about', async (req, res) => {
+  try {
+    const rawU = String(req.query.u || '').trim();
+    if (!rawU || !isTwitchUrl(rawU)) {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      return res.status(400).json({ error: 'Provide ?u= with a twitch.tv URL' });
+    }
+
+    const sourceUrl = normalizeTwitchAboutUrl(rawU);
+    const jinaUrl = 'https://r.jina.ai/http://' + sourceUrl.replace(/^https?:\/\//i, '');
+
+    const { signal, cancel } = timeoutSignal(12000);
+    const r = await fetch(jinaUrl, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; RelayBot/1.0)',
+        'Accept': 'text/plain,*/*;q=0.8'
+      },
+      redirect: 'follow',
+      signal
+    }).catch((e) => ({ ok: false, status: 599, _err: e }));
+    cancel();
+
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    if (!r || !r.ok) {
+      return res.status(502).json({ error: 'upstream_unavailable', status: r && r.status });
+    }
+
+    const rawText = await r.text();
+    const markdown = extractMarkdownSection(rawText);
+    const { headings, lines } = structureMarkdown(markdown);
+
+    return res.status(200).json({
+      sourceUrl,
+      fetchedFrom: 'jina',
+      format: 'markdown',
+      markdown,
+      headings,
+      lines,
+      fetchedAt: new Date().toISOString()
+    });
+  } catch (e) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    return res.status(200).json({ sourceUrl: null, format: 'markdown', markdown: '' }); // fail-soft
+  }
 });
 
 /* --------------------------------- Start -------------------------------- */
