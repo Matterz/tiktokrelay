@@ -110,25 +110,51 @@ function extractYouTubeMainByline(markdown, sourceUrl){
 
 function extractTwitchAboutByline(markdown){
   const txt = unwrapJina(markdown);
-  // Split on paragraphs; score for human-ish "About me" text; avoid cookie/legal blobs
-  const BAD = /\b(cookie|cookies|consent|advertis|privacy|policy|analytics|partners|third[- ]party|marketing|targeting|gdpr|do not sell)\b/i;
-  const paras = txt.split(/\n{2,}/)
-    .map(p => p.split('\n').map(s => s.trim()).filter(Boolean).join(' '))
-    .map(stripLinksAndJunk)
-    .filter(Boolean)
-    .filter(p => !BAD.test(p));
+  if (!txt) return '';
 
-  let best = '';
-  let bestScore = -1;
-  for (const p of paras) {
-    const s =
-      (p.length >= 40 && p.length <= 400 ? 60 : 0) +
-      (/[.!?]["']?$/.test(p) ? 10 : 0) +
-      (/\b(i|my|me|we|stream|streaming|live|gaming|videos?|subscribe|follow|community|thank you)\b/i.test(p) ? 25 : 0) +
-      (/\babout\b/i.test(p) ? 10 : 0);
-    if (s > bestScore) { bestScore = s; best = p; }
+  // Split into paragraphs (blank-line delimited)
+  const paras = txt
+    .split(/\n{2,}/)
+    .map(p => p.trim())
+    .filter(Boolean);
+
+  // Find the followers paragraph
+  const FOLLOWERS_RE = /\b\d[\d.,]*\s*(?:[kmb]|thousand|million|billion|k)?\s*followers\b/i;
+  let idx = -1;
+  for (let i = 0; i < paras.length; i++) {
+    const p = paras[i];
+    if (FOLLOWERS_RE.test(p) || /\bfollowers\b/i.test(p)) { idx = i; break; }
   }
-  return clamp100(best);
+  if (idx === -1) {
+    // If no followers block found, keep previous behavior by picking first decent paragraph
+    const generic = paras
+      .map(stripLinksAndJunk)
+      .find(p => p && /\s/.test(p) && p.length >= 20);
+    return clamp100(generic || '');
+  }
+
+  // Gather up to 3 content paragraphs *after* the followers block.
+  const BAD_CTA = /^(follow|following|subscribe|subscribed|gift a sub|gift sub|report|share|chat|send a message|emote[- ]?only|shop|store|block)$/i;
+  const BAD_PHRASE = /welcome to the chat room!/i;
+
+  const picked = [];
+  for (let j = idx + 1; j < paras.length && picked.length < 3; j++) {
+    let cand = paras[j]
+      .replace(/\[[^\]]*\]\([^)]*\)/g, ' ') // strip [text](url)
+      .replace(/\b(?:https?:\/\/|www\.)\S+/gi, ' ') // strip bare URLs
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!cand) continue;
+    if (BAD_PHRASE.test(cand)) continue;
+    if (BAD_CTA.test(cand)) continue;
+
+    picked.push(cand);
+  }
+
+  // Join the 3 paragraphs; downstream still expects a short hint, so clamp.
+  const joined = picked.join('\n\n').trim();
+  return clamp100(joined);
 }
 
 function extractGenericByline(markdown){
