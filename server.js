@@ -7,6 +7,128 @@ const { WebcastPushConnection } = require('tiktok-live-connector');
 
 const app = express();
 
+// --- Byline helpers ---------------------------------------------------------
+function escRe(s){ return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+function unwrapJina(md){
+  if (!md) return '';
+  let t = String(md).replace(/\r\n/g, '\n');
+  const i = t.toLowerCase().indexOf('markdown content:');
+  return i !== -1 ? t.slice(i + 'markdown content:'.length) : t;
+}
+function stripLinksAndJunk(s){
+  return String(s)
+    // remove "...more" and "…more"
+    .replace(/(?:\.{3}|…)\s*more/gi, ' ')
+    // strip markdown links completely → ****
+    .replace(/\[[^\]]*?\]\([^)]+?\)/g, '****')
+    // strip bare URLs → ****
+    .replace(/\b(?:https?:\/\/|www\.)[^\s)]+/gi, '****')
+    // drop bracketed/braced fragments
+    .replace(/[\[\]{}]/g, ' ')
+    // drop "and N more links"
+    .replace(/\band\s+\d+\s+more\s+links?\b/gi, ' ')
+    // collapse whitespace
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+function dedupeHead(s){
+  // If the first ~40 chars repeat immediately (common on some YT scrapes), keep one.
+  const txt = String(s).trim();
+  if (txt.length < 30) return txt;
+  for (let n = 40; n >= 20; n--) {
+    const a = txt.slice(0, n);
+    const b = txt.slice(n, n*2);
+    if (a && b && b.startsWith(a)) return (a + txt.slice(n*2)).trim();
+  }
+  return txt;
+}
+function clamp100(s){
+  const t = String(s).trim();
+  if (t.length <= 100) return t;
+  return t.slice(0, 100).replace(/\s+\S*$/, '') + '…';
+}
+
+// --- Platform-aware extraction ----------------------------------------------
+function extractYouTubeMainByline(markdown, sourceUrl){
+  const txt = unwrapJina(markdown);
+
+  // Find the text right AFTER the "X subscribers • Y videos" line
+  const m = txt.match(/\bsubscribers\b[^\n]{0,200}?\bvideos\b\s*([^\n]{8,600})/i);
+  if (!m || !m[1]) return '';
+
+  let body = stripLinksAndJunk(m[1]);
+
+  // Redact channel handle/name derived from URL
+  try {
+    const handleFromAt = (sourceUrl.match(/youtube\.com\/@([^/?#]+)/i) || [])[1];
+    const handleFromUC = (sourceUrl.match(/youtube\.com\/channel\/(UC[0-9A-Za-z_-]{22})/i) || [])[1];
+    const h = handleFromAt || handleFromUC || '';
+    if (h) {
+      body = body
+        .replace(new RegExp('\\b' + escRe(h) + '\\b', 'gi'), '****')
+        .replace(new RegExp('\\b' + escRe(h.replace(/^@+/, '')) + '\\b', 'gi'), '****');
+    }
+  } catch {}
+
+  body = dedupeHead(body);
+  return clamp100(body);
+}
+
+function extractTwitchAboutByline(markdown){
+  const txt = unwrapJina(markdown);
+  // Split on paragraphs; score for human-ish "About me" text; avoid cookie/legal blobs
+  const BAD = /\b(cookie|cookies|consent|advertis|privacy|policy|analytics|partners|third[- ]party|marketing|targeting|gdpr|do not sell)\b/i;
+  const paras = txt.split(/\n{2,}/)
+    .map(p => p.split('\n').map(s => s.trim()).filter(Boolean).join(' '))
+    .map(stripLinksAndJunk)
+    .filter(Boolean)
+    .filter(p => !BAD.test(p));
+
+  let best = '';
+  let bestScore = -1;
+  for (const p of paras) {
+    const s =
+      (p.length >= 40 && p.length <= 400 ? 60 : 0) +
+      (/[.!?]["']?$/.test(p) ? 10 : 0) +
+      (/\b(i|my|me|we|stream|streaming|live|gaming|videos?|subscribe|follow|community|thank you)\b/i.test(p) ? 25 : 0) +
+      (/\babout\b/i.test(p) ? 10 : 0);
+    if (s > bestScore) { bestScore = s; best = p; }
+  }
+  return clamp100(best);
+}
+
+function extractGenericByline(markdown){
+  const txt = unwrapJina(markdown);
+  const NAV = /^(home|videos|shorts|live|playlists|community|channels|store|members|about|description|search|subscriptions|popular|stats|links?|details?|location|joined|business|email|contact|creator|more)$/i;
+  const BAD = /\b(cookie|cookies|consent|privacy|policy|analytics|partners|third[- ]party|marketing|targeting)\b/i;
+
+  const paras = txt.split(/\n{2,}/)
+    .map(p => p.split('\n').map(s => s.trim()).filter(Boolean).filter(l => !NAV.test(l)).join(' '))
+    .map(stripLinksAndJunk)
+    .filter(Boolean)
+    .filter(p => !BAD.test(p));
+
+  let best = '';
+  let score = -1;
+  for (const p of paras) {
+    const s =
+      (p.length >= 40 && p.length <= 400 ? 60 : 0) +
+      (/[.!?]["']?$/.test(p) ? 10 : 0) +
+      (/\b(i|my|we|channel|subscribe|video|videos|stream|streaming|gaming|variety)\b/i.test(p) ? 20 : 0);
+    if (s > score) { score = s; best = p; }
+  }
+  return clamp100(best);
+}
+
+function extractBylineFor(url, markdown){
+  const u = String(url || '').toLowerCase();
+  if (/youtube\.com/.test(u))   return extractYouTubeMainByline(markdown, url);
+  if (/twitch\.tv/.test(u))     return extractTwitchAboutByline(markdown);
+  return extractGenericByline(markdown);
+}
+
 /* ----------------------------- CORS (global) ----------------------------- */
 /* Allow the browser to call these endpoints from any origin (Bluehost, etc.) */
 app.use((req, res, next) => {
@@ -27,44 +149,42 @@ app.get('/', (_req, res) => res.type('text/plain').send('TikTok SSE relay & Byli
  * - On success: 200 text/plain (raw text body from Jina).
  * - On any failure: 4xx/5xx JSON; client should treat as "hint unavailable".
  */
+// --- Byline proxy: YT uses MAIN page; sanitize; single attempt; no client fallback ------
 app.get('/byline', async (req, res) => {
   try {
-    const raw = String(req.query.u || '').trim();
-    if (!/^https?:\/\//i.test(raw)) {
-      return res.status(400).json({ error: 'missing_or_invalid_u' });
+    let rawUrl = String(req.query.u || '').trim();
+    if (!rawUrl) return res.status(400).type('text/plain').send('Missing u');
+
+    // Allow only known platforms
+    const ok = /^(https?:)?\/\/(?:www\.)?(youtube\.com|twitch\.tv|kick\.com)\b/i.test(rawUrl);
+    if (!ok) return res.status(400).type('text/plain').send('Unsupported host');
+
+    // For YouTube: force the MAIN channel page (strip any trailing /about)
+    if (/youtube\.com/i.test(rawUrl)) {
+      rawUrl = rawUrl.replace(/\/about(?:$|[/?#].*)/i, '');
     }
 
-    // Build Jina endpoint that returns text for the provided URL
-    const endpoint = 'https://r.jina.ai/http://' + raw.replace(/^https?:\/\//, '');
+    // Build Jina fetch (textified mirror)
+    const target = rawUrl.replace(/^https?:\/\//i, '');
+    const jina   = 'https://r.jina.ai/http://' + target;
 
-    // Fetch once (no retry/fallback)
-    const UA =
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-      '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-
-    const r = await fetch(endpoint, {
+    const r = await fetch(jina, {
+      method: 'GET',
       redirect: 'follow',
-      headers: { 'user-agent': UA, 'accept-language': 'en-US,en;q=0.9' }
+      headers: { 'user-agent': 'byline-proxy/1.0', 'accept-language': 'en-US,en;q=0.9' }
     });
 
-    const body = await r.text();
+    if (!r.ok) return res.status(502).type('text/plain').send('Fetch failed');
 
-    if (!r.ok || !body) {
-      return res.status(502).json({
-        error: 'upstream_error',
-        status: r.status,
-        hint: 'byline_unavailable_this_round'
-      });
-    }
+    const md = await r.text();
+    const byline = extractBylineFor(rawUrl, md);
 
-    // Success: return plain text so the client parser can work with it
-    return res.type('text/plain').status(200).send(body);
+    if (!byline) return res.status(204).end(); // empty → client shows “unavailable this round”
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.type('text/plain').send(byline);
   } catch (e) {
-    return res.status(502).json({
-      error: 'fetch_failed',
-      message: e?.message || String(e),
-      hint: 'byline_unavailable_this_round'
-    });
+    console.error('byline error:', e && e.message ? e.message : e);
+    res.status(503).type('text/plain').send('Unavailable');
   }
 });
 
