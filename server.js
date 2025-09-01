@@ -112,49 +112,44 @@ function extractTwitchAboutByline(markdown){
   const txt = unwrapJina(markdown);
   if (!txt) return '';
 
-  // Split into paragraphs (blank-line delimited)
-  const paras = txt
-    .split(/\n{2,}/)
-    .map(p => p.trim())
-    .filter(Boolean);
-
-  // Find the followers paragraph
-  const FOLLOWERS_RE = /\b\d[\d.,]*\s*(?:[kmb]|thousand|million|billion|k)?\s*followers\b/i;
-  let idx = -1;
-  for (let i = 0; i < paras.length; i++) {
-    const p = paras[i];
-    if (FOLLOWERS_RE.test(p) || /\bfollowers\b/i.test(p)) { idx = i; break; }
-  }
-  if (idx === -1) {
-    // If no followers block found, keep previous behavior by picking first decent paragraph
-    const generic = paras
-      .map(stripLinksAndJunk)
-      .find(p => p && /\s/.test(p) && p.length >= 20);
-    return clamp100(generic || '');
+  // 1) Find the FIRST line that contains "followers" (case-insensitive), regardless of paragraph splits.
+  const reFollowersLine = /^.*?\bfollowers\b.*$/gim;
+  const match = reFollowersLine.exec(txt);
+  if (!match) {
+    // Fallback: no followers line found — return empty so caller can decide.
+    return '';
   }
 
-  // Gather up to 3 content paragraphs *after* the followers block.
+  // 2) From the end of that line, jump to the NEXT blank-line boundary.
+  const endOfLine = match.index + match[0].length;
+  const nextBlank = txt.indexOf('\n\n', endOfLine);
+  const startIdx = nextBlank >= 0 ? nextBlank + 2 : endOfLine;
+
+  // 3) Collect the NEXT up to 3 non-CTA paragraphs.
+  const rest = txt.slice(startIdx);
+  const paras = rest.split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+
   const BAD_CTA = /^(follow|following|subscribe|subscribed|gift a sub|gift sub|report|share|chat|send a message|emote[- ]?only|shop|store|block)$/i;
   const BAD_PHRASE = /welcome to the chat room!/i;
 
   const picked = [];
-  for (let j = idx + 1; j < paras.length && picked.length < 3; j++) {
-    let cand = paras[j]
-      .replace(/\[[^\]]*\]\([^)]*\)/g, ' ') // strip [text](url)
+  for (let j = 0; j < paras.length && picked.length < 3; j++) {
+    // Keep original paragraph text (to preserve headings/emojis), but skip obvious junk.
+    const candClean = paras[j]
+      .replace(/\[[^\]]*\]\([^)]*\)/g, ' ')        // strip [text](url)
       .replace(/\b(?:https?:\/\/|www\.)\S+/gi, ' ') // strip bare URLs
       .replace(/\s+/g, ' ')
       .trim();
 
-    if (!cand) continue;
-    if (BAD_PHRASE.test(cand)) continue;
-    if (BAD_CTA.test(cand)) continue;
+    if (!candClean) continue;
+    if (BAD_PHRASE.test(candClean)) continue;
+    if (BAD_CTA.test(candClean)) continue;
 
-    picked.push(cand);
+    picked.push(paras[j]); // push the original (unflattened) paragraph
   }
 
-  // Join the 3 paragraphs; downstream still expects a short hint, so clamp.
-  const joined = picked.join('\n\n').trim();
-  return clamp100(joined);
+  // 4) Return EXACTLY the 3 paragraphs after followers (or fewer if not enough).
+  return picked.join('\n\n');
 }
 
 function extractGenericByline(markdown){
