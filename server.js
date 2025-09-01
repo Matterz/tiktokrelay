@@ -107,13 +107,44 @@ function extractYouTubeMainByline(markdown, sourceUrl){
   return clamp100(body);
 }
 
+// --- TWITCH: followers-block extractor (NEW) -------------------------------
+// Grab the paragraph right after the "<count> followers" block:  "<count> followers\\n\\n<BYLINE>\\n\\n"
+function extractTwitchBylineAfterFollowers(markdown) {
+  const txt = unwrapJina(markdown);
+  if (!txt) return '';
+
+  // Split into paragraphs by blank lines
+  const paras = txt
+    .split(/\\n{2,}/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  // Followers regex examples: "9.4M followers", "9,400,000 followers", "9400 followers", "9.4 million followers"
+  const FOLLOWERS_RE = /\\b\\d[\\d.,]*\\s*(?:[kmb]|thousand|million|billion)?\\s*followers\\b/i;
+
+  for (let i = 0; i < paras.length - 1; i++) {
+    const p = paras[i];
+    if (FOLLOWERS_RE.test(p) || /\\bfollowers\\b/i.test(p)) {
+      let next = paras[i + 1] || '';
+      // Avoid common Twitch chat banner
+      if (/welcome to the chat room!/i.test(next)) continue;
+      // Remove markdown links and collapse spaces
+      next = next
+        .replace(/\\[[^\\]]*\\]\\([^)]*\\)/g, ' ')
+        .replace(/\\s+/g, ' ')
+        .trim();
+      if (next) return clamp100(next);
+    }
+  }
+  return '';
+}
 
 function extractTwitchAboutByline(markdown){
   const txt = unwrapJina(markdown);
   // Split on paragraphs; score for human-ish "About me" text; avoid cookie/legal blobs
-  const BAD = /\b(cookie|cookies|consent|advertis|privacy|policy|analytics|partners|third[- ]party|marketing|targeting|gdpr|do not sell)\b/i;
-  const paras = txt.split(/\n{2,}/)
-    .map(p => p.split('\n').map(s => s.trim()).filter(Boolean).join(' '))
+  const BAD = /\\b(cookie|cookies|consent|advertis|privacy|policy|analytics|partners|third[- ]party|marketing|targeting|gdpr|do not sell)\\b/i;
+  const paras = txt.split(/\\n{2,}/)
+    .map(p => p.split('\\n').map(s => s.trim()).filter(Boolean).join(' '))
     .map(stripLinksAndJunk)
     .filter(Boolean)
     .filter(p => !BAD.test(p));
@@ -124,8 +155,8 @@ function extractTwitchAboutByline(markdown){
     const s =
       (p.length >= 40 && p.length <= 400 ? 60 : 0) +
       (/[.!?]["']?$/.test(p) ? 10 : 0) +
-      (/\b(i|my|me|we|stream|streaming|live|gaming|videos?|subscribe|follow|community|thank you)\b/i.test(p) ? 25 : 0) +
-      (/\babout\b/i.test(p) ? 10 : 0);
+      (/\\b(i|my|me|we|stream|streaming|live|gaming|videos?|subscribe|follow|community|thank you)\\b/i.test(p) ? 25 : 0) +
+      (/\\babout\\b/i.test(p) ? 10 : 0);
     if (s > bestScore) { bestScore = s; best = p; }
   }
   return clamp100(best);
@@ -134,10 +165,10 @@ function extractTwitchAboutByline(markdown){
 function extractGenericByline(markdown){
   const txt = unwrapJina(markdown);
   const NAV = /^(home|videos|shorts|live|playlists|community|channels|store|members|about|description|search|subscriptions|popular|stats|links?|details?|location|joined|business|email|contact|creator|more)$/i;
-  const BAD = /\b(cookie|cookies|consent|privacy|policy|analytics|partners|third[- ]party|marketing|targeting)\b/i;
+  const BAD = /\\b(cookie|cookies|consent|privacy|policy|analytics|partners|third[- ]party|marketing|targeting)\\b/i;
 
-  const paras = txt.split(/\n{2,}/)
-    .map(p => p.split('\n').map(s => s.trim()).filter(Boolean).filter(l => !NAV.test(l)).join(' '))
+  const paras = txt.split(/\\n{2,}/)
+    .map(p => p.split('\\n').map(s => s.trim()).filter(Boolean).filter(l => !NAV.test(l)).join(' '))
     .map(stripLinksAndJunk)
     .filter(Boolean)
     .filter(p => !BAD.test(p));
@@ -148,7 +179,7 @@ function extractGenericByline(markdown){
     const s =
       (p.length >= 40 && p.length <= 400 ? 60 : 0) +
       (/[.!?]["']?$/.test(p) ? 10 : 0) +
-      (/\b(i|my|we|channel|subscribe|video|videos|stream|streaming|gaming|variety)\b/i.test(p) ? 20 : 0);
+      (/\\b(i|my|we|channel|subscribe|video|videos|stream|streaming|gaming|variety)\\b/i.test(p) ? 20 : 0);
     if (s > score) { score = s; best = p; }
   }
   return clamp100(best);
@@ -156,8 +187,12 @@ function extractGenericByline(markdown){
 
 function extractBylineFor(url, markdown){
   const u = String(url || '').toLowerCase();
-  if (/youtube\.com/.test(u))   return extractYouTubeMainByline(markdown, url);
-  if (/twitch\.tv/.test(u))     return extractTwitchAboutByline(markdown);
+  if (/youtube\\.com/.test(u))   return extractYouTubeMainByline(markdown, url);
+  if (/twitch\\.tv/.test(u)) {
+    // NEW: prefer followers-block extraction; fallback to previous heuristic
+    const afterFollowers = extractTwitchBylineAfterFollowers(markdown);
+    return afterFollowers || extractTwitchAboutByline(markdown);
+  }
   return extractGenericByline(markdown);
 }
 
@@ -188,16 +223,16 @@ app.get('/byline', async (req, res) => {
     if (!rawUrl) return res.status(400).type('text/plain').send('Missing u');
 
     // Allow only known platforms
-    const ok = /^(https?:)?\/\/(?:www\.)?(youtube\.com|twitch\.tv|kick\.com)\b/i.test(rawUrl);
+    const ok = /^(https?:)?\\/\\/(?:www\\.)?(youtube\\.com|twitch\\.tv|kick\\.com)\\b/i.test(rawUrl);
     if (!ok) return res.status(400).type('text/plain').send('Unsupported host');
 
     // For YouTube: force the MAIN channel page (strip any trailing /about)
-    if (/youtube\.com/i.test(rawUrl)) {
-      rawUrl = rawUrl.replace(/\/about(?:$|[/?#].*)/i, '');
+    if (/youtube\\.com/i.test(rawUrl)) {
+      rawUrl = rawUrl.replace(/\\/about(?:$|[\\/?#].*)/i, '');
     }
 
     // Build Jina fetch (textified mirror)
-    const target = rawUrl.replace(/^https?:\/\//i, '');
+    const target = rawUrl.replace(/^https?:\\/\\//i, '');
     const jina   = 'https://r.jina.ai/http://' + target;
 
     const r = await fetch(jina, {
@@ -233,7 +268,7 @@ app.get('/tiktok-sse', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
 
   // keep-alive ping so proxies don’t close the stream
-  const keepAlive = setInterval(() => res.write(':\n\n'), 15000);
+  const keepAlive = setInterval(() => res.write(':\\n\\n'), 15000);
 
   // backoff for reconnects when not live yet
   const delays = [2000, 5000, 10000, 20000, 30000, 60000];
@@ -250,8 +285,8 @@ app.get('/tiktok-sse', async (req, res) => {
 
   function writeEvent(event, data) {
     try {
-      res.write(`event: ${event}\n`);
-      res.write(`data: ${JSON.stringify(data)}\n\n`);
+      res.write(`event: ${event}\\n`);
+      res.write(`data: ${JSON.stringify(data)}\\n\\n`);
     } catch {}
   }
 
@@ -314,7 +349,7 @@ app.get('/tiktok-sse', async (req, res) => {
 
 // Is this a Twitch URL?
 function isTwitchUrl(u) {
-  return /(^|\/\/)(www\.)?twitch\.tv\//i.test(String(u));
+  return /(^|\\/\\/)(www\\.)?twitch\\.tv\\//i.test(String(u));
 }
 
 // Normalize to https://twitch.tv/<user>/about
@@ -325,7 +360,7 @@ function normalizeTwitchAboutUrl(raw) {
     const user = (url.pathname.split('/').filter(Boolean)[0] || '').replace(/^@/, '');
     return user ? `${url.origin}/${user}/about` : `${url.origin}/about`;
   } catch {
-    return u.replace(/\/+$/, '') + '/about';
+    return u.replace(/\\/+$/, '') + '/about';
   }
 }
 
@@ -345,8 +380,8 @@ function extractMarkdownSection(rawText) {
 
 // Light structure for convenience (you can ignore this client-side if you want)
 function structureMarkdown(md) {
-  const lines = md.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-  const headings = lines.filter((l) => /^#{1,6}\s+\S/.test(l));
+  const lines = md.split(/\\r?\\n/).map((s) => s.trim()).filter(Boolean);
+  const headings = lines.filter((l) => /^#{1,6}\\s+\\S/.test(l));
   return { headings, lines };
 }
 
@@ -361,7 +396,7 @@ app.get('/twitch-about', async (req, res) => {
     }
 
     const sourceUrl = normalizeTwitchAboutUrl(rawU);
-    const jinaUrl = 'https://r.jina.ai/http://' + sourceUrl.replace(/^https?:\/\//i, '');
+    const jinaUrl = 'https://r.jina.ai/http://' + sourceUrl.replace(/^https?:\\/\\//i, '');
 
     const { signal, cancel } = timeoutSignal(12000);
     const r = await fetch(jinaUrl, {
