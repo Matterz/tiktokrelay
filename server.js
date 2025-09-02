@@ -2,6 +2,15 @@
 const express = require('express');
 const { WebcastPushConnection } = require('@qixils/tiktok-live-connector');
 
+// Debug: confirm which TikTok connector actually loads at runtime
+try {
+  const modPath = require.resolve('@qixils/tiktok-live-connector');
+  const modPkg = require('@qixils/tiktok-live-connector/package.json');
+  console.log('[TikTok LC] Using', modPath, 'version', modPkg.version);
+} catch (e) {
+  console.warn('[TikTok LC] Could not resolve @qixils package:', e && e.message);
+}
+
 // If you're on Node < 18, uncomment the next line and add `node-fetch` to deps.
 // const fetch = (...args) => import('node-fetch').then(m => m.default(...args));
 
@@ -506,6 +515,17 @@ app.get('/tiktok-sse', async (req, res) => {
       res.write(`data: ${JSON.stringify(data)}\n\n`);
     } catch (_) { /* socket closed */ }
   };
+  
+  // Report which library is actually in use
+	try {
+	  send('debug', {
+		stage: 'lib',
+		module: require.resolve('@qixils/tiktok-live-connector'),
+		version: require('@qixils/tiktok-live-connector/package.json').version
+	  });
+	} catch (e) {
+	  send('debug', { stage: 'lib', module: 'unresolved', error: String(e && e.message || e) });
+	}
 
   // Keep the stream open
   const keepAlive = setInterval(() => { try { res.write(': keep-alive\n\n'); } catch (_) {} }, 15000);
