@@ -50,6 +50,27 @@ function clamp100(s){
   return t.slice(0, 100).replace(/\s+\S*$/, '') + '…';
 }
 
+// Raw Twitch extractor: return the next N paragraphs AFTER the first occurrence of "followers"
+function extractTwitchAfterFollowersRaw(markdown, count = 3){
+  const txt = unwrapJina(markdown);
+  if (!txt) return '';
+
+  // Find the first occurrence of "followers" anywhere
+  const pos = txt.toLowerCase().indexOf('followers');
+  if (pos === -1) return '';
+
+  // From there, jump to the next paragraph boundary (blank line)
+  const restFromFollowers = txt.slice(pos);
+  const sep = restFromFollowers.match(/\n\s*\n/);
+  const startIdx = sep ? (pos + sep.index + sep[0].length) : (pos + 'followers'.length);
+
+  // Now collect the next N paragraphs
+  const rest = txt.slice(startIdx);
+  const paras = rest.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+
+  return paras.slice(0, count).join('\n\n');
+}
+
 // Dedupe immediate repeated sentences (e.g., "Hi! ... Hi! ...")
 function dedupeSentences(s){
   const parts = String(s || '').split(/([.!?]["']?\s+)/); // keep sentence separators
@@ -230,6 +251,16 @@ app.get('/byline', async (req, res) => {
     if (!r.ok) return res.status(502).type('text/plain').send('Fetch failed');
 
     const md = await r.text();
+    // Twitch raw mode: return 3 paragraphs AFTER "followers" with no clamping/sanitization
+    if (/twitch\.tv/i.test(rawUrl) && String(req.query.raw || '') === '1') {
+      const rawParas = extractTwitchAfterFollowersRaw(md, 3);
+      if (rawParas) {
+        res.set('Cache-Control', 'public, max-age=900');
+        return res.type('text/plain').send(rawParas);
+      }
+      // If not found, return 204 to indicate no hint
+      return res.status(204).end();
+    }
     const byline = extractBylineFor(rawUrl, md);
 
     if (!byline) return res.status(204).end(); // empty → client shows “unavailable this round”
