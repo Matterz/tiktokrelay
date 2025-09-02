@@ -7,10 +7,10 @@ const { WebcastPushConnection } = require('tiktok-live-connector');
 
 const app = express();
 
-// --- Byline helpers ---------------------------------------------------------
-function escRe(s){ return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+// Ensure Express trusts proxies (Render/NGINX)
+app.set('trust proxy', 1);
 
-// --- CORS (allow your Bluehost domain + localhost) ---
+// CORS allowlist (can be '*' if you prefer; here we still send '*' as fallback)
 const ALLOW_ORIGINS = new Set([
   'https://keyguessing.com',
   'https://www.keyguessing.com',
@@ -18,88 +18,33 @@ const ALLOW_ORIGINS = new Set([
   'http://127.0.0.1:5500',
   'http://localhost:8080'
 ]);
-
-function corsMiddleware(req, res, next) {
+function setCORS(req, res) {
   const origin = req.headers.origin;
-  if (origin && (ALLOW_ORIGINS.has(origin))) {
+  if (origin && ALLOW_ORIGINS.has(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
   } else {
-    // Safe default for simple GETs (no credentials)
     res.setHeader('Access-Control-Allow-Origin', '*');
   }
-
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+}
 
-  if (req.method === 'OPTIONS') {
-    res.statusCode = 204;
-    return res.end();
-  }
+// Global CORS middleware
+app.use((req, res, next) => {
+  setCORS(req, res);
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
-}
+});
 
-app.use(corsMiddleware);
+// Fetch shim (works on Node < 18 too)
+const _fetch = (typeof fetch === 'function')
+  ? fetch
+  : (...args) => import('node-fetch').then(m => m.default(...args));
 
-// Build redaction tokens from a Twitch username (mask partials too).
-function twitchRedactionTokens(username) {
-  const out = new Set();
-  const orig = String(username || '');
-  const base = orig.toLowerCase().replace(/[^a-z0-9]/g, '');
-  if (!base) return [];
 
-  out.add(base); // full
-
-  // Split on camelCase/number and underscores
-  const parts = (orig.match(/[A-Z]?[a-z]+|[0-9]+|[A-Z]+(?![a-z])/g) || []).map(s => s.toLowerCase());
-  for (const p of parts) if (p.length >= 4) out.add(p);
-
-  // Add sliding substrings of the base (length 5..8) to catch partials like "darkviper"
-  for (let L = Math.min(8, base.length); L >= 5; L--) {
-    for (let i = 0; i + L <= base.length; i++) {
-      out.add(base.slice(i, i + L));
-    }
-    if (out.size > 64) break; // cap
-  }
-
-  // Sort longest first to avoid partial overlap issues
-  return Array.from(out).sort((a, b) => b.length - a.length);
-}
-
-function twitchUsernameFromUrl(u) {
-  try {
-    const url = new URL(u);
-    const seg = (url.pathname.split('/').filter(Boolean)[0] || '').replace(/^@/, '');
-    return seg || '';
-  } catch {
-    const m = String(u || '').match(/twitch\.tv\/([^\/?#]+)/i);
-    return m ? m[1] : '';
-  }
-}
-
-// Redact: emails, links, and username (including partials) from a byline
-function redactBylineForTwitch(text, url) {
-  let out = String(text || '');
-
-  // Emails → ****
-  out = out.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '****');
-
-  // Links/URLs → ****
-  out = out.replace(/\b(?:https?:\/\/|www\.)\S+/gi, '****');
-
-  // Username tokens → ****
-  const user = twitchUsernameFromUrl(url);
-  if (user) {
-    const toks = twitchRedactionTokens(user);
-    if (toks.length) {
-      const re = new RegExp(toks.map(t => escRe(t)).join('|'), 'gi');
-      out = out.replace(re, '****');
-    }
-  }
-
-  // Collapse whitespace
-  return out.replace(/\s+/g, ' ').trim();
-}
+// --- Byline helpers ---------------------------------------------------------
+function escRe(s){ return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 function unwrapJina(md){
   if (!md) return '';
   let t = String(md).replace(/\r\n/g, '\n');
@@ -199,69 +144,27 @@ function extractYouTubeMainByline(markdown, sourceUrl){
 }
 
 
-function extractTwitchAboutByline(markdown, sourceUrl){
+function extractTwitchAboutByline(markdown){
   const txt = unwrapJina(markdown);
-  if (!txt) return '';
+  // Split on paragraphs; score for human-ish "About me" text; avoid cookie/legal blobs
+  const BAD = /\b(cookie|cookies|consent|advertis|privacy|policy|analytics|partners|third[- ]party|marketing|targeting|gdpr|do not sell)\b/i;
+  const paras = txt.split(/\n{2,}/)
+    .map(p => p.split('\n').map(s => s.trim()).filter(Boolean).join(' '))
+    .map(stripLinksAndJunk)
+    .filter(Boolean)
+    .filter(p => !BAD.test(p));
 
-  const lines = txt.split('\n');
-
-  // Prefer followers line that appears AFTER the "### About ..." heading
-  let aboutIdx = -1;
-  for (let i = 0; i < lines.length; i++) {
-    if (/^###\s+about\b/i.test(lines[i].trim())) { aboutIdx = i; break; }
+  let best = '';
+  let bestScore = -1;
+  for (const p of paras) {
+    const s =
+      (p.length >= 40 && p.length <= 400 ? 60 : 0) +
+      (/[.!?]["']?$/.test(p) ? 10 : 0) +
+      (/\b(i|my|me|we|stream|streaming|live|gaming|videos?|subscribe|follow|community|thank you)\b/i.test(p) ? 25 : 0) +
+      (/\babout\b/i.test(p) ? 10 : 0);
+    if (s > bestScore) { bestScore = s; best = p; }
   }
-
-  let followersIdx = -1;
-  if (aboutIdx !== -1) {
-    for (let i = aboutIdx; i < lines.length; i++) {
-      if (/\bfollowers\b/i.test(lines[i])) { followersIdx = i; break; }
-    }
-  }
-  // Fallback: second "followers" anywhere
-  if (followersIdx === -1) {
-    let hits = 0;
-    for (let i = 0; i < lines.length; i++) {
-      if (/\bfollowers\b/i.test(lines[i])) {
-        hits++;
-        if (hits === 2) { followersIdx = i; break; }
-      }
-    }
-  }
-  if (followersIdx === -1) return '';
-
-  // Walk forward to next meaningful line, skipping CTAs, bullets, link-only lines, headers, "·", and stop at [![ (image panel)
-  const BAD_CTA = /^(follow|following|subscribe|subscribed|gift a sub|gift sub|report|share|chat|send a message|emote[- ]?only|shop|store|block)$/i;
-  const LINK_ONLY = /^\s*(?:\*+\s*)?\[[^\]]+\]\([^)]*\)\s*$/i;
-  const BULLET_LINK = /^\s*\*\s+\[[^\]]+\]\([^)]*\)\s*$/i;
-  const JUST_DOT = /^\s*[·*]+\s*$/;
-  const HEADER_LINE = /^\s*#{1,6}\s+\S/;
-  const IMAGE_LINK = /^\s*\[\!\[/; // [![Image ...]
-
-  for (let i = followersIdx + 1; i < lines.length; i++) {
-    let raw = lines[i].trim();
-    if (!raw) continue;
-    if (IMAGE_LINK.test(raw)) break;
-    if (HEADER_LINE.test(raw)) continue;
-    if (JUST_DOT.test(raw)) continue;
-    if (BULLET_LINK.test(raw)) continue;
-    if (LINK_ONLY.test(raw)) continue;
-    if (BAD_CTA.test(raw)) continue;
-
-    // Clean inline links and bare URLs
-    let cleaned = raw
-      .replace(/\[[^\]]*\]\([^)]*\)/g, ' ')
-      .replace(/\b(?:https?:\/\/|www\.)\S+/gi, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    if (!cleaned || cleaned === '·') continue;
-    if (/^\[\!\[/.test(cleaned)) break;
-
-    cleaned = redactBylineForTwitch(cleaned, sourceUrl);
-    return clamp100(cleaned);
-  }
-
-  return '';
+  return clamp100(best);
 }
 
 function extractGenericByline(markdown){
@@ -290,7 +193,7 @@ function extractGenericByline(markdown){
 function extractBylineFor(url, markdown){
   const u = String(url || '').toLowerCase();
   if (/youtube\.com/.test(u))   return extractYouTubeMainByline(markdown, url);
-  if (/twitch\.tv/.test(u))     return extractTwitchAboutByline(markdown, url);
+  if (/twitch\.tv/.test(u))     return extractTwitchAboutByline(markdown);
   return extractGenericByline(markdown);
 }
 
@@ -317,122 +220,141 @@ app.get('/', (_req, res) => res.type('text/plain').send('TikTok SSE relay & Byli
 // --- Byline proxy: YT uses MAIN page; sanitize; single attempt; no client fallback ------
 app.get('/byline', async (req, res) => {
   try {
+    setCORS(req, res); // belt & suspenders
+
     let rawUrl = String(req.query.u || '').trim();
     if (!rawUrl) return res.status(400).type('text/plain').send('Missing u');
 
-    // Allow only known platforms
+    // Only known platforms
     const ok = /^(https?:)?\/\/(?:www\.)?(youtube\.com|twitch\.tv|kick\.com)\b/i.test(rawUrl);
     if (!ok) return res.status(400).type('text/plain').send('Unsupported host');
 
-    // For YouTube: force the MAIN channel page (strip any trailing /about)
+    // YouTube: force main channel page (strip trailing /about)
     if (/youtube\.com/i.test(rawUrl)) {
       rawUrl = rawUrl.replace(/\/about(?:$|[/?#].*)/i, '');
     }
 
-    // Build Jina fetch (textified mirror)
+    // Fetch via r.jina.ai mirror
     const target = rawUrl.replace(/^https?:\/\//i, '');
     const jina   = 'https://r.jina.ai/http://' + target;
 
-    const r = await fetch(jina, {
+    const r = await _fetch(jina, {
       method: 'GET',
       redirect: 'follow',
       headers: { 'user-agent': 'byline-proxy/1.0', 'accept-language': 'en-US,en;q=0.9' }
     });
 
-    if (!r.ok) return res.status(502).type('text/plain').send('Fetch failed');
+    if (!r.ok) {
+      // Important: include CORS headers even on error
+      setCORS(req, res);
+      return res.status(502).type('text/plain').send('Fetch failed');
+    }
 
     const md = await r.text();
-    // Twitch raw=1: return the FULL About page markdown (no cleanup)
-    if (/twitch\.tv/i.test(rawUrl) && String(req.query.raw || '') === '1') {
-      const fullAbout = unwrapJina(md);
-      if (fullAbout) {
-        res.set('Cache-Control', 'public, max-age=900');
-        return res.type('text/plain').send(fullAbout);
-      }
-      return res.status(204).end();
-    }
     const byline = extractBylineFor(rawUrl, md);
 
-    if (!byline) return res.status(204).end(); // empty → client shows “unavailable this round”
+    if (!byline) {
+      setCORS(req, res);
+      return res.status(204).end();
+    }
+
     res.set('Cache-Control', 'public, max-age=3600');
-    res.type('text/plain').send(byline);
+    setCORS(req, res);
+    return res.type('text/plain').send(byline);
   } catch (e) {
     console.error('byline error:', e && e.message ? e.message : e);
-    res.status(503).type('text/plain').send('Unavailable');
+    setCORS(req, res);
+    return res.status(503).type('text/plain').send('Unavailable');
   }
 });
 
-// --- TikTok SSE (REPLACE YOUR EXISTING HANDLER WITH THIS) ---
+/* ------------------------------ TikTok SSE ------------------------------- */
+/** SSE endpoint: /tiktok-sse?user=keyaogames */
 app.get('/tiktok-sse', async (req, res) => {
-  try {
-    // CORS (global middleware already set these, but keeping essentials here too)
-    const origin = req.headers.origin;
-    if (origin && ALLOW_ORIGINS.has(origin)) {
-      res.setHeader('Access-Control-Allow-Origin', origin);
-      res.setHeader('Vary', 'Origin');
-    } else {
-      res.setHeader('Access-Control-Allow-Origin', '*');
-    }
+  setCORS(req, res);
 
-    // SSE headers
-    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache, no-transform'); // avoid proxy transformations
-    res.setHeader('X-Accel-Buffering', 'no');                 // disable nginx buffering if present
-    res.setHeader('Connection', 'keep-alive');
+  const user = String(req.query.user || '').trim().toLowerCase();
+  if (!user) return res.status(400).json({ error: 'Missing ?user=' });
 
-    if (typeof res.flushHeaders === 'function') {
-      res.flushHeaders(); // send headers immediately
-    }
+  // SSE headers
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('X-Accel-Buffering', 'no'); // nginx proxies
+  res.setHeader('Connection', 'keep-alive');
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
-    // Helper to write SSE frames safely
-    const send = (event, dataObj) => {
-      try {
-        if (event) res.write(`event: ${event}\n`);
-        const payload = (typeof dataObj === 'string') ? dataObj : JSON.stringify(dataObj || {});
-        res.write(`data: ${payload}\n\n`);
-      } catch (_) { /* socket probably closed */ }
-    };
+  // keep-alive ping
+  const keepAlive = setInterval(() => { try { res.write(': keep-alive\n\n'); } catch (_) {} }, 15000);
 
-    // Initial status breadcrumb to help your client know we’re up
-    send('status', { state: 'connected', ts: Date.now() });
+  const delays = [2000, 5000, 10000, 20000, 30000, 60000];
+  let attempt = 0;
+  let tiktok = null;
+  let closed = false;
 
-    // Keep-alive ping (prevents idle intermediaries from closing the stream)
-    const keepAlive = setInterval(() => {
-      try { res.write(': keep-alive\n\n'); } catch (_) {}
-    }, 15000);
+  const cleanup = () => {
+    clearInterval(keepAlive);
+    try { tiktok && tiktok.disconnect(); } catch {}
+  };
+  req.on('close', () => { closed = true; cleanup(); });
 
-    // ---- your existing TikTok connection logic goes here ----
-    // When you receive a chat payload, do:  send('chat', chatPayload);
+  const send = (event, data) => {
+    try {
+      res.write(`event: ${event}\n`);
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    } catch (_) {}
+  };
 
-    // Example skeleton — keep your current implementation if you already have one:
-    const username = String(req.query.user || '').trim().toLowerCase();
-    if (!username) {
-      send('debug', { error: 'missing username param ?user=' });
-      clearInterval(keepAlive);
-      return res.end();
-    }
+  function errPayload(e) {
+    if (!e) return { message: 'unknown' };
+    const out = { message: e.message || String(e) };
+    if (e.code) out.code = e.code;
+    if (e.statusCode) out.statusCode = e.statusCode;
+    if (e.status) out.status = e.status;
+    return out;
+  }
 
-    // TODO: plug in your actual TikTok connector; on chat message: send('chat', {...})
-    // For example:
-    // connector.on('chat', (msg) => send('chat', msg));
-    // connector.on('status', (s) => send('status', s));
+  async function connect(trigger) {
+    if (closed) return;
+    if (tiktok) { try { tiktok.disconnect(); } catch {} tiktok = null; }
 
-    // Tidy up on client disconnect
-    req.on('close', () => {
-      clearInterval(keepAlive);
-      try {
-        // connector && connector.disconnect();
-      } catch(_) {}
-      try { res.end(); } catch(_) {}
+    send('debug', { stage: 'attempt', user, trigger });
+
+    tiktok = new WebcastPushConnection(user, { enableExtendedGiftInfo: false });
+
+    tiktok.on('chat', (msg) => {
+      send('chat', {
+        comment: String(msg.comment || ''),
+        uniqueId: msg.uniqueId || '',
+        nickname: msg.nickname || ''
+      });
     });
 
-  } catch (err) {
+    const onDisc = () => { send('status', { state: 'disconnected' }); schedule('disconnected'); };
+    const onErr  = (e) => { send('status', { state: 'error', ...errPayload(e) }); schedule('error'); };
+    const onEnd  = () => { send('status', { state: 'ended' }); schedule('streamEnd'); };
+    tiktok.on('disconnected', onDisc);
+    tiktok.on('error', onErr);
+    tiktok.on('streamEnd', onEnd);
+
     try {
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.statusCode = 500;
-      res.end(JSON.stringify({ error: 'sse_init_failed', detail: String(err) }));
-    } catch (_) {}
+      await tiktok.connect();
+      attempt = 0;
+      send('status', { state: 'connected', user });
+      send('open', { ok: true, user });
+    } catch (e) {
+      send('status', { state: 'error', ...errPayload(e) });
+      schedule('connect:reject');
+    }
   }
+
+  function schedule(reason) {
+    if (closed) return;
+    const wait = delays[Math.min(attempt++, delays.length - 1)];
+    send('debug', { stage: 'retry', user, inMs: wait, reason });
+    setTimeout(() => connect('retry'), wait);
+  }
+
+  connect('init');
 });
 
 // --- Twitch-only helpers for full About page proxy ---
@@ -478,6 +400,16 @@ function structureMarkdown(md) {
 // GET /twitch-about?u=<twitch-channel-url>
 // Returns JSON: { sourceUrl, format: "markdown", markdown, headings[], lines[] }
 app.get('/twitch-about', async (req, res) => {
+  // inside your /twitch-about handler:
+const r = await _fetch(jinaUrl, {
+  method: 'GET',
+  headers: {
+    'User-Agent': 'Mozilla/5.0 (compatible; RelayBot/1.0)',
+    'Accept': 'text/plain,*/*;q=0.8'
+  },
+  redirect: 'follow'
+});
+
   try {
     const rawU = String(req.query.u || '').trim();
     if (!rawU || !isTwitchUrl(rawU)) {
