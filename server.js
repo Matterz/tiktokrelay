@@ -546,6 +546,8 @@ function makeMsToken() {
   return t;
 }
 const msToken = makeMsToken();
+const sessionId = (process.env.TIKTOK_SESSIONID || '').trim();
+
 
 // Start with browser-like headers (for cookie fetch + connector)
 const baseHeaders = {
@@ -573,9 +575,13 @@ let extraCookie = '';
 try { extraCookie = await getTikTokCookieHeader(user, baseHeaders); } catch {}
 
 // Final Cookie header we’ll use everywhere
-const cookieHeader = ['msToken=' + msToken, 'tt-web-region=US']
-  .concat(extraCookie ? [extraCookie] : [])
-  .join('; ');
+const cookieParts = ['msToken=' + msToken, 'tt-web-region=US'];
+if (extraCookie) cookieParts.push(extraCookie);
+if (sessionId) {
+  cookieParts.push('sessionid=' + sessionId);     // primary login cookie
+  cookieParts.push('sessionid_ss=' + sessionId);  // secondary key some edges check
+}
+const cookieHeader = cookieParts.join('; ');
 
 // Single headers object for both scraping and connector requests
 const commonHeaders = {
@@ -612,6 +618,7 @@ tiktok = new WebcastPushConnection(user, {
 
   // Some versions read this:
   userAgent: ua,
+  sessionId: sessionId || undefined, 
 
   // Query params appended to the internal HTTP calls
   clientParams: {
