@@ -350,6 +350,40 @@ app.get('/byline', async (req, res) => {
 
 /* ------------------------------ TikTok SSE ------------------------------- */
 /** SSE endpoint: /tiktok-sse?user=keyaogames */
+
+// Safely serialize any thrown/reported error so it never crashes the SSE writer
+function serializeErr(e) {
+  try {
+    if (!e) return { message: 'unknown' };
+    if (e instanceof Error) {
+      return {
+        name: e.name || 'Error',
+        message: String(e.message || 'unknown'),
+        code: e.code,
+        stack: e.stack
+      };
+    }
+    if (typeof e === 'object') {
+      const out = {};
+      for (const k of ['message','name','code','status','statusCode','type','errno','syscall']) {
+        if (e && e[k] !== undefined) out[k] = typeof e[k] === 'object' ? JSON.stringify(e[k]) : String(e[k]);
+      }
+      // Common axios-style nesting
+      if (e && e.response && typeof e.response === 'object') {
+        out.response = {};
+        for (const k of ['status','statusText']) {
+          if (e.response[k] !== undefined) out.response[k] = e.response[k];
+        }
+      }
+      return out.message || Object.keys(out).length ? out : { message: String(e) };
+    }
+    return { message: String(e) };
+  } catch {
+    // As a last resort, coerce to string
+    return { message: String(e || 'unknown') };
+  }
+}
+
 app.get('/tiktok-sse', async (req, res) => {
   setCORS(req, res);
 
@@ -359,11 +393,18 @@ app.get('/tiktok-sse', async (req, res) => {
   // SSE headers
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.setHeader('X-Accel-Buffering', 'no'); // nginx proxies
+  res.setHeader('X-Accel-Buffering', 'no');
   res.setHeader('Connection', 'keep-alive');
   if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
-  // keep-alive ping
+  const send = (event, data) => {
+    try {
+      res.write(`event: ${event}\n`);
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    } catch (_) { /* socket closed */ }
+  };
+
+  // Keep the stream open
   const keepAlive = setInterval(() => { try { res.write(': keep-alive\n\n'); } catch (_) {} }, 15000);
 
   const delays = [2000, 5000, 10000, 20000, 30000, 60000];
@@ -377,20 +418,11 @@ app.get('/tiktok-sse', async (req, res) => {
   };
   req.on('close', () => { closed = true; cleanup(); });
 
-  const send = (event, data) => {
-    try {
-      res.write(`event: ${event}\n`);
-      res.write(`data: ${JSON.stringify(data)}\n\n`);
-    } catch (_) {}
-  };
-
-  function errPayload(e) {
-    if (!e) return { message: 'unknown' };
-    const out = { message: e.message || String(e) };
-    if (e.code) out.code = e.code;
-    if (e.statusCode) out.statusCode = e.statusCode;
-    if (e.status) out.status = e.status;
-    return out;
+  function schedule(reason) {
+    if (closed) return;
+    const wait = delays[Math.min(attempt++, delays.length - 1)];
+    send('debug', { stage: 'retry', user, inMs: wait, reason });
+    setTimeout(() => connect('retry'), wait);
   }
 
   async function connect(trigger) {
@@ -399,8 +431,10 @@ app.get('/tiktok-sse', async (req, res) => {
 
     send('debug', { stage: 'attempt', user, trigger });
 
+    // Keep your existing options if you had them; this is a safe default.
     tiktok = new WebcastPushConnection(user, { enableExtendedGiftInfo: false });
 
+    // Forward chat
     tiktok.on('chat', (msg) => {
       send('chat', {
         comment: String(msg.comment || ''),
@@ -409,8 +443,9 @@ app.get('/tiktok-sse', async (req, res) => {
       });
     });
 
+    // Robust error forwarding (never stringify as [object Object])
     const onDisc = () => { send('status', { state: 'disconnected' }); schedule('disconnected'); };
-    const onErr  = (e) => { send('status', { state: 'error', ...errPayload(e) }); schedule('error'); };
+    const onErr  = (e) => { send('status', { state: 'error', error: serializeErr(e) }); schedule('error'); };
     const onEnd  = () => { send('status', { state: 'ended' }); schedule('streamEnd'); };
     tiktok.on('disconnected', onDisc);
     tiktok.on('error', onErr);
@@ -422,16 +457,10 @@ app.get('/tiktok-sse', async (req, res) => {
       send('status', { state: 'connected', user });
       send('open', { ok: true, user });
     } catch (e) {
-      send('status', { state: 'error', ...errPayload(e) });
+      // Typical offline / blocked cases end up here; report a clean payload
+      send('status', { state: 'error', error: serializeErr(e) });
       schedule('connect:reject');
     }
-  }
-
-  function schedule(reason) {
-    if (closed) return;
-    const wait = delays[Math.min(attempt++, delays.length - 1)];
-    send('debug', { stage: 'retry', user, inMs: wait, reason });
-    setTimeout(() => connect('retry'), wait);
   }
 
   connect('init');
