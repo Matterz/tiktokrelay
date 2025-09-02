@@ -46,6 +46,27 @@ const _fetch = (typeof fetch === 'function')
 // --- Byline helpers ---------------------------------------------------------
 function escRe(s){ return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
+// Remove ugly masked tail like "********;)" or trailing asterisks + punctuation
+function stripMaskedTail(s){
+  let out = String(s || '');
+  // Only do aggressive tail cleaning if masked tokens appear near the end
+  if (/\*{4,}[^\S\r\n]*(?:[;:]-?\)|[)\]}.,;:!?]+)?\s*$/.test(out)) {
+    let prev;
+    do {
+      prev = out;
+      // remove smileys like ;) or :) at the very end
+      out = out.replace(/\s*(?:;|:)-?\)\s*$/,'')
+               // then trailing brackets/parens
+               .replace(/\s*[)\]}]+\s*$/,'')
+               // then trailing punctuation runs
+               .replace(/\s*[,.;:!?]+\s*$/,'')
+               // finally trailing runs of masked asterisks
+               .replace(/\s*\*{4,}\s*$/,'');
+    } while (out.length < prev.length);
+  }
+  return out.trim();
+}
+
 // --- Twitch redaction helpers (mask email, links, and handle/partials ≥4 chars) ---
 function twitchUsernameFromUrl(u) {
   try {
@@ -196,11 +217,14 @@ function extractYouTubeMainByline(markdown, sourceUrl){
   //  - Sentence-level dedupe
   body = dedupeSentences(body);
 
-  // Final tidy (also collapses any lingering “more” we missed)
-  body = dedupeHead(body);
+// Final tidy (also collapses any lingering “more” we missed)
+body = dedupeHead(body);
 
-  // Show a concise hint (100 chars)
-  return clamp100(body);
+// Drop masked junk if it appears at the very end (e.g., "********;)")
+body = stripMaskedTail(body);
+
+// Show a concise hint (100 chars)
+return clamp100(body);
 }
 
 function extractTwitchAboutByline(markdown, sourceUrl){
