@@ -384,6 +384,62 @@ function serializeErr(e) {
   }
 }
 
+// Extract Set-Cookie headers across fetch implementations
+function getSetCookieArray(resp) {
+  try {
+    if (resp && typeof resp.headers?.getSetCookie === 'function') {
+      return resp.headers.getSetCookie();             // node 18 fetch on some hosts
+    }
+    if (resp && typeof resp.headers?.raw === 'function') {
+      const raw = resp.headers.raw();                 // node-fetch
+      if (raw && raw['set-cookie']) return raw['set-cookie'];
+    }
+    const v = resp && resp.headers && resp.headers.get && resp.headers.get('set-cookie');
+    return v ? [v] : [];
+  } catch { return []; }
+}
+
+// Parse cookie strings into a map
+function parseCookies(setCookieArr) {
+  const jar = {};
+  for (const line of (setCookieArr || [])) {
+    const pair = String(line).split(';')[0];
+    const i = pair.indexOf('=');
+    if (i > 0) {
+      const name = pair.slice(0, i).trim();
+      const val  = pair.slice(i + 1).trim();
+      if (name && val) jar[name] = val;
+    }
+  }
+  return jar;
+}
+
+// Try to get useful TikTok cookies (ttwid, odin_tt, etc.) to reduce rejections
+async function getTikTokCookieHeader(user, baseHeaders) {
+  const urls = [
+    `https://www.tiktok.com/@${encodeURIComponent(user)}/live`,
+    `https://www.tiktok.com/@${encodeURIComponent(user)}`,
+    `https://www.tiktok.com/`
+  ];
+  const jar = {};
+  for (const url of urls) {
+    try {
+      const r = await _fetch(url, { method: 'GET', headers: baseHeaders, redirect: 'follow' });
+      const arr = getSetCookieArray(r);
+      const got = parseCookies(arr);
+      Object.assign(jar, got);
+      if (jar.ttwid) break; // usually enough
+    } catch {}
+  }
+  const parts = [];
+  if (jar.ttwid) parts.push(`ttwid=${jar.ttwid}`);
+  if (jar.odin_tt) parts.push(`odin_tt=${jar.odin_tt}`);
+  if (jar['tt_csrf_token']) parts.push(`tt_csrf_token=${jar['tt_csrf_token']}`);
+  if (jar['s_v_web_id']) parts.push(`s_v_web_id=${jar['s_v_web_id']}`);
+  return parts.join('; ');
+}
+
+
 // Robustly scrape a TikTok @user page to find a live roomId
 async function scrapeRoomIdFromWebProfile(user, headers) {
   const urlLive = `https://www.tiktok.com/@${encodeURIComponent(user)}/live`;
@@ -479,24 +535,40 @@ async function connect(trigger) {
   send('debug', { stage: 'attempt', user, trigger });
 
   // --- Client fingerprint / headers ---
-  const referer = `https://www.tiktok.com/@${encodeURIComponent(user)}/live`;
-  const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
+const referer = `https://www.tiktok.com/@${encodeURIComponent(user)}/live`;
+const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
 
-  function makeMsToken() {
-    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-    let t = '';
-    for (let i = 0; i < 107; i++) t += chars[(Math.random() * chars.length) | 0];
-    return t;
-  }
-  const msToken = makeMsToken();
+function makeMsToken() {
+  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let t = '';
+  for (let i = 0; i < 107; i++) t += chars[(Math.random() * chars.length) | 0];
+  return t;
+}
+const msToken = makeMsToken();
 
-  const commonHeaders = {
-    'User-Agent': ua,
-    'Referer': referer,
-    'Origin': 'https://www.tiktok.com',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Cookie': `msToken=${msToken}; tt-web-region=US;`
-  };
+// Start with browser-like headers (for cookie fetch + connector)
+const baseHeaders = {
+  'User-Agent': ua,
+  'Referer': referer,
+  'Origin': 'https://www.tiktok.com',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9'
+};
+
+// Acquire TikTok cookies (ttwid, odin_tt, etc.)
+let extraCookie = '';
+try { extraCookie = await getTikTokCookieHeader(user, baseHeaders); } catch {}
+
+// Final Cookie header we’ll use everywhere
+const cookieHeader = ['msToken=' + msToken, 'tt-web-region=US']
+  .concat(extraCookie ? [extraCookie] : [])
+  .join('; ');
+
+// Single headers object for both scraping and connector requests
+const commonHeaders = {
+  ...baseHeaders,
+  'Cookie': cookieHeader
+};
 
   // --- Pre-scrape roomId from public web page to avoid library’s brittle path
   let roomId = null;
