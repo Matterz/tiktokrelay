@@ -561,6 +561,7 @@ const baseHeaders = {
   'Sec-Fetch-Site': 'same-site',
   'Sec-Fetch-Mode': 'cors',
   'Sec-Fetch-Dest': 'empty',
+  'Accept-Encoding': 'gzip, deflate, br',
 
   // Typical accept set used by the site
   'Accept': 'application/json, text/plain, */*',
@@ -616,7 +617,7 @@ tiktok = new WebcastPushConnection(user, {
     browser_platform: 'Win32',
     browser_name: 'Mozilla',
     browser_version: '5.0',
-    // IMPORTANT: include msToken as a query param too
+    // IMPORTANT: send msToken in query too
     msToken
   },
 
@@ -627,6 +628,34 @@ tiktok = new WebcastPushConnection(user, {
     headers: commonHeaders          // includes msToken + ttwid/odin_tt cookies
   }
 });
+
+// Force our headers/cookies into the connector’s internal axios instances
+try {
+  if (tiktok && tiktok.http && tiktok.http.defaults) {
+    tiktok.http.defaults.withCredentials = true;
+    tiktok.http.defaults.headers = {
+      ...(tiktok.http.defaults.headers || {}),
+      ...commonHeaders
+    };
+    if (tiktok.http.defaults.headers.common) {
+      Object.assign(tiktok.http.defaults.headers.common, commonHeaders);
+    }
+  }
+} catch {}
+
+try {
+  // Some versions have a nested webcast client
+  if (tiktok && tiktok.webcastClient && tiktok.webcastClient.http && tiktok.webcastClient.http.defaults) {
+    tiktok.webcastClient.http.defaults.withCredentials = true;
+    tiktok.webcastClient.http.defaults.headers = {
+      ...(tiktok.webcastClient.http.defaults.headers || {}),
+      ...commonHeaders
+    };
+    if (tiktok.webcastClient.http.defaults.headers.common) {
+      Object.assign(tiktok.webcastClient.http.defaults.headers.common, commonHeaders);
+    }
+  }
+} catch {}
 
   // --- events (unchanged)
   tiktok.on('chat', (msg) => {
