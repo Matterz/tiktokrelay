@@ -1,6 +1,6 @@
 // server.js
 const express = require('express');
-const { WebcastPushConnection } = require('tiktok-live-connector');
+const { WebcastPushConnection } = require('@qixils/tiktok-live-connector');
 
 // If you're on Node < 18, uncomment the next line and add `node-fetch` to deps.
 // const fetch = (...args) => import('node-fetch').then(m => m.default(...args));
@@ -617,7 +617,8 @@ tiktok = new WebcastPushConnection(user, {
   enableExtendedGiftInfo: false,
 
   // Some versions read this:
-  userAgent: ua,
+  roomId,
+	userAgent: ua,
   sessionId: sessionId || undefined, 
 
   // Query params appended to the internal HTTP calls
@@ -686,89 +687,16 @@ try {
   tiktok.on('error', onErr);
   tiktok.on('streamEnd', onEnd);
 
-	// --- Connect using discovered roomId (force-bypass the lib’s room lookup) ---
-
-	// 0) Prime fields *and* hard-override room-id retrievers on both instance & prototype
-	try {
-	  const rid = String(roomId);
-
-	  // Prime commonly read fields
-	  try { tiktok.roomId = rid; } catch {}
-	  try { tiktok.uniqueId = user; } catch {}
-
-	  // Build a stub that always returns our room id
-	  const stubRoomId = async () => rid;
-
-	  // Patch on the instance (if present)
-	  try {
-		if (typeof tiktok._retrieveRoomId2 === 'function') tiktok._retrieveRoomId2 = stubRoomId;
-		if (typeof tiktok._retrieveRoomId  === 'function') tiktok._retrieveRoomId  = stubRoomId;
-	  } catch {}
-
-	  // Patch on the prototype (some builds call the prototype directly)
-	  try {
-		const proto = Object.getPrototypeOf(tiktok);
-		if (proto && typeof proto._retrieveRoomId2 === 'function') proto._retrieveRoomId2 = stubRoomId;
-		if (proto && typeof proto._retrieveRoomId  === 'function') proto._retrieveRoomId  = stubRoomId;
-	  } catch {}
-
-	  // Some builds call into an HTML fetcher on the web client; stub that too
-	  try {
-		if (tiktok.webClient && typeof tiktok.webClient.fetchRoomInfoFromHtml === 'function') {
-		  tiktok.webClient.fetchRoomInfoFromHtml = async () => ({ roomId: rid });
-		}
-	  } catch {}
-	} catch { /* non-fatal */ }
-
-
+// Connect directly with the known room id (fork honors this and skips HTML scraping)
 try {
-  // 2) Call connect() with NO args. The patched retrievers short-circuit to our roomId.
-  await tiktok.connect();
+  await tiktok.connect(roomId);     // <- no internal room-id fetch
   attempt = 0;
   send('status', { state: 'connected', user, roomId });
   send('open', { ok: true, user, roomId });
-} catch (e1) {
-  const err1 = serializeErr(e1);
-  send('status', { state: 'error', where: 'connect:first', error: err1 });
-
-  try {
-    // 3) Fallback: drop Host override (some edges dislike it) and force again
-    try {
-      if (tiktok.http?.defaults?.headers) {
-        delete tiktok.http.defaults.headers.Host;
-        if (tiktok.http.defaults.headers.common) delete tiktok.http.defaults.headers.common.Host;
-      }
-    } catch {}
-    try {
-      if (tiktok.webcastClient?.http?.defaults?.headers) {
-        delete tiktok.webcastClient.http.defaults.headers.Host;
-        if (tiktok.webcastClient.http.defaults.headers.common) delete tiktok.webcastClient.http.defaults.headers.common.Host;
-      }
-    } catch {}
-
-    await tiktok.connect();
-    attempt = 0;
-    send('status', { state: 'connected', user, roomId });
-    send('open', { ok: true, user, roomId });
-  } catch (e2) {
-    // 4) Last resort: try explicit parameter form used by some builds
-    const err2 = serializeErr(e2);
-    send('status', { state: 'error', where: 'connect:second', error: err2 });
-
-    try {
-      await tiktok.connect(String(roomId)); // string form for older builds
-      attempt = 0;
-      send('status', { state: 'connected', user, roomId });
-      send('open', { ok: true, user, roomId });
-    } catch (e3) {
-      send('status', { state: 'error', where: 'connect:final', error: serializeErr(e3) });
-      schedule('connect:reject');
-    }
-  }
+} catch (e) {
+  send('status', { state: 'error', where: 'connect', error: serializeErr(e) });
+  schedule('connect:reject');
 }
-
-}
-
   connect('init');
 });
 
