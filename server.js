@@ -679,30 +679,40 @@ try {
   tiktok.on('error', onErr);
   tiktok.on('streamEnd', onEnd);
 
-	// --- Connect using discovered roomId (prefer explicit first) ---
 	// --- Connect using discovered roomId (force-bypass the lib’s room lookup) ---
 
-// 0) Prime some fields the lib reads internally
-try { if ('roomId' in tiktok) tiktok.roomId = String(roomId); } catch {}
-try { if ('uniqueId' in tiktok) tiktok.uniqueId = user; } catch {}
+	// 0) Prime fields *and* hard-override room-id retrievers on both instance & prototype
+	try {
+	  const rid = String(roomId);
 
-// 1) Monkey-patch the private retrievers to always return our scraped roomId
-try {
-  if (typeof tiktok._retrieveRoomId2 === 'function') {
-    tiktok._retrieveRoomId2 = async () => String(roomId);
-  }
-  if (typeof tiktok._retrieveRoomId === 'function') {
-    tiktok._retrieveRoomId = async () => String(roomId);
-  }
-  // Some builds go through the webClient HTML fetcher on connect()
-  if (tiktok.webClient && typeof tiktok.webClient.fetchRoomInfoFromHtml === 'function') {
-    const original = tiktok.webClient.fetchRoomInfoFromHtml;
-    tiktok.webClient.fetchRoomInfoFromHtml = async (opts = {}) => {
-      // Return the minimal shape the lib expects so it never 404s on HTML
-      return { roomId: String(roomId) };
-    };
-  }
-} catch { /* non-fatal */ }
+	  // Prime commonly read fields
+	  try { tiktok.roomId = rid; } catch {}
+	  try { tiktok.uniqueId = user; } catch {}
+
+	  // Build a stub that always returns our room id
+	  const stubRoomId = async () => rid;
+
+	  // Patch on the instance (if present)
+	  try {
+		if (typeof tiktok._retrieveRoomId2 === 'function') tiktok._retrieveRoomId2 = stubRoomId;
+		if (typeof tiktok._retrieveRoomId  === 'function') tiktok._retrieveRoomId  = stubRoomId;
+	  } catch {}
+
+	  // Patch on the prototype (some builds call the prototype directly)
+	  try {
+		const proto = Object.getPrototypeOf(tiktok);
+		if (proto && typeof proto._retrieveRoomId2 === 'function') proto._retrieveRoomId2 = stubRoomId;
+		if (proto && typeof proto._retrieveRoomId  === 'function') proto._retrieveRoomId  = stubRoomId;
+	  } catch {}
+
+	  // Some builds call into an HTML fetcher on the web client; stub that too
+	  try {
+		if (tiktok.webClient && typeof tiktok.webClient.fetchRoomInfoFromHtml === 'function') {
+		  tiktok.webClient.fetchRoomInfoFromHtml = async () => ({ roomId: rid });
+		}
+	  } catch {}
+	} catch { /* non-fatal */ }
+
 
 try {
   // 2) Call connect() with NO args. The patched retrievers short-circuit to our roomId.
