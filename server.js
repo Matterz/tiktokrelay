@@ -50,27 +50,6 @@ function clamp100(s){
   return t.slice(0, 100).replace(/\s+\S*$/, '') + '…';
 }
 
-// Raw Twitch extractor: return the next N paragraphs AFTER the first occurrence of "followers"
-function extractTwitchAfterFollowersRaw(markdown, count = 3){
-  const txt = unwrapJina(markdown);
-  if (!txt) return '';
-
-  // Find the first occurrence of "followers" anywhere
-  const pos = txt.toLowerCase().indexOf('followers');
-  if (pos === -1) return '';
-
-  // From there, jump to the next paragraph boundary (blank line)
-  const restFromFollowers = txt.slice(pos);
-  const sep = restFromFollowers.match(/\n\s*\n/);
-  const startIdx = sep ? (pos + sep.index + sep[0].length) : (pos + 'followers'.length);
-
-  // Now collect the next N paragraphs
-  const rest = txt.slice(startIdx);
-  const paras = rest.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
-
-  return paras.slice(0, count).join('\n\n');
-}
-
 // Dedupe immediate repeated sentences (e.g., "Hi! ... Hi! ...")
 function dedupeSentences(s){
   const parts = String(s || '').split(/([.!?]["']?\s+)/); // keep sentence separators
@@ -131,46 +110,25 @@ function extractYouTubeMainByline(markdown, sourceUrl){
 
 function extractTwitchAboutByline(markdown){
   const txt = unwrapJina(markdown);
-  if (!txt) return '';
+  // Split on paragraphs; score for human-ish "About me" text; avoid cookie/legal blobs
+  const BAD = /\b(cookie|cookies|consent|advertis|privacy|policy|analytics|partners|third[- ]party|marketing|targeting|gdpr|do not sell)\b/i;
+  const paras = txt.split(/\n{2,}/)
+    .map(p => p.split('\n').map(s => s.trim()).filter(Boolean).join(' '))
+    .map(stripLinksAndJunk)
+    .filter(Boolean)
+    .filter(p => !BAD.test(p));
 
-  // 1) Find the FIRST line that contains "followers" (case-insensitive), regardless of paragraph splits.
-  const reFollowersLine = /^.*?\bfollowers\b.*$/gim;
-  const match = reFollowersLine.exec(txt);
-  if (!match) {
-    // Fallback: no followers line found — return empty so caller can decide.
-    return '';
+  let best = '';
+  let bestScore = -1;
+  for (const p of paras) {
+    const s =
+      (p.length >= 40 && p.length <= 400 ? 60 : 0) +
+      (/[.!?]["']?$/.test(p) ? 10 : 0) +
+      (/\b(i|my|me|we|stream|streaming|live|gaming|videos?|subscribe|follow|community|thank you)\b/i.test(p) ? 25 : 0) +
+      (/\babout\b/i.test(p) ? 10 : 0);
+    if (s > bestScore) { bestScore = s; best = p; }
   }
-
-  // 2) From the end of that line, jump to the NEXT blank-line boundary.
-  const endOfLine = match.index + match[0].length;
-  const nextBlank = txt.indexOf('\n\n', endOfLine);
-  const startIdx = nextBlank >= 0 ? nextBlank + 2 : endOfLine;
-
-  // 3) Collect the NEXT up to 3 non-CTA paragraphs.
-  const rest = txt.slice(startIdx);
-  const paras = rest.split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
-
-  const BAD_CTA = /^(follow|following|subscribe|subscribed|gift a sub|gift sub|report|share|chat|send a message|emote[- ]?only|shop|store|block)$/i;
-  const BAD_PHRASE = /welcome to the chat room!/i;
-
-  const picked = [];
-  for (let j = 0; j < paras.length && picked.length < 3; j++) {
-    // Keep original paragraph text (to preserve headings/emojis), but skip obvious junk.
-    const candClean = paras[j]
-      .replace(/\[[^\]]*\]\([^)]*\)/g, ' ')        // strip [text](url)
-      .replace(/\b(?:https?:\/\/|www\.)\S+/gi, ' ') // strip bare URLs
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    if (!candClean) continue;
-    if (BAD_PHRASE.test(candClean)) continue;
-    if (BAD_CTA.test(candClean)) continue;
-
-    picked.push(paras[j]); // push the original (unflattened) paragraph
-  }
-
-  // 4) Return EXACTLY the 3 paragraphs after followers (or fewer if not enough).
-  return picked.join('\n\n');
+  return clamp100(best);
 }
 
 function extractGenericByline(markdown){
@@ -251,14 +209,13 @@ app.get('/byline', async (req, res) => {
     if (!r.ok) return res.status(502).type('text/plain').send('Fetch failed');
 
     const md = await r.text();
-    // Twitch raw mode: return 3 paragraphs AFTER "followers" with no clamping/sanitization
+    // Twitch raw mode: return FULL about page markdown (no trimming)
     if (/twitch\.tv/i.test(rawUrl) && String(req.query.raw || '') === '1') {
-      const rawParas = extractTwitchAfterFollowersRaw(md, 3);
-      if (rawParas) {
+      const fullAbout = unwrapJina(md);
+      if (fullAbout) {
         res.set('Cache-Control', 'public, max-age=900');
-        return res.type('text/plain').send(rawParas);
+        return res.type('text/plain').send(fullAbout);
       }
-      // If not found, return 204 to indicate no hint
       return res.status(204).end();
     }
     const byline = extractBylineFor(rawUrl, md);
