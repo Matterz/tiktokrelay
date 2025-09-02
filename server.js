@@ -583,6 +583,13 @@ const commonHeaders = {
   'Cookie': cookieHeader
 };
 
+// Webcast endpoints are on a different host; some edges check Host explicitly
+const webcastHeaders = {
+  ...commonHeaders,
+  Host: 'webcast.tiktok.com'
+};
+
+
   // --- Pre-scrape roomId from public web page to avoid library’s brittle path
   let roomId = null;
   try {
@@ -603,6 +610,7 @@ const commonHeaders = {
   // --- Build the connector AFTER we have a room id
 tiktok = new WebcastPushConnection(user, {
   enableExtendedGiftInfo: false,
+  headers: webcastHeaders
 
   // Some versions read this:
   userAgent: ua,
@@ -635,10 +643,10 @@ try {
     tiktok.http.defaults.withCredentials = true;
     tiktok.http.defaults.headers = {
       ...(tiktok.http.defaults.headers || {}),
-      ...commonHeaders
+      ...webcastHeaders
     };
     if (tiktok.http.defaults.headers.common) {
-      Object.assign(tiktok.http.defaults.headers.common, commonHeaders);
+      Object.assign(tiktok.http.defaults.headers.common, webcastHeaders);
     }
   }
 } catch {}
@@ -649,10 +657,10 @@ try {
     tiktok.webcastClient.http.defaults.withCredentials = true;
     tiktok.webcastClient.http.defaults.headers = {
       ...(tiktok.webcastClient.http.defaults.headers || {}),
-      ...commonHeaders
+      ...webcastHeaders
     };
     if (tiktok.webcastClient.http.defaults.headers.common) {
-      Object.assign(tiktok.webcastClient.http.defaults.headers.common, commonHeaders);
+      Object.assign(tiktok.webcastClient.http.defaults.headers.common, webcastHeaders);
     }
   }
 } catch {}
@@ -672,16 +680,45 @@ try {
   tiktok.on('error', onErr);
   tiktok.on('streamEnd', onEnd);
 
-  // --- Connect using discovered roomId (skips library’s internal discovery)
-  try {
-    await tiktok.connect(roomId);
-    attempt = 0;
-    send('status', { state: 'connected', user, roomId });
-    send('open', { ok: true, user, roomId });
-  } catch (e) {
-    send('status', { state: 'error', where: 'connect', error: serializeErr(e) });
-    schedule('connect:reject');
-  }
+	// Prime the connector with the known roomId (if the property exists on this version)
+	try { if ('roomId' in tiktok) { tiktok.roomId = roomId; } } catch {}
+
+	try {
+	  // Primary: call connect() with NO args (uses primed roomId + our forced headers)
+	  await tiktok.connect();
+	  attempt = 0;
+	  send('status', { state: 'connected', user, roomId });
+	  send('open', { ok: true, user, roomId });
+	} catch (e1) {
+	  // Fallback once: drop Host override and try explicit connect(roomId)
+	  const err1 = serializeErr(e1);
+	  send('status', { state: 'error', where: 'connect:first', error: err1 });
+
+	  try {
+		// Remove the Host override from both axios clients
+		try {
+		  if (tiktok.http?.defaults?.headers) {
+			delete tiktok.http.defaults.headers.Host;
+			if (tiktok.http.defaults.headers.common) delete tiktok.http.defaults.headers.common.Host;
+		  }
+		} catch {}
+		try {
+		  if (tiktok.webcastClient?.http?.defaults?.headers) {
+			delete tiktok.webcastClient.http.defaults.headers.Host;
+			if (tiktok.webcastClient.http.defaults.headers.common) delete tiktok.webcastClient.http.defaults.headers.common.Host;
+		  }
+		} catch {}
+
+		await tiktok.connect(roomId);
+		attempt = 0;
+		send('status', { state: 'connected', user, roomId });
+		send('open', { ok: true, user, roomId });
+	  } catch (e2) {
+		send('status', { state: 'error', where: 'connect:fallback', error: serializeErr(e2) });
+		schedule('connect:reject');
+	  }
+	}
+
 }
 
   connect('init');
