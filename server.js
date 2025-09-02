@@ -425,87 +425,109 @@ app.get('/tiktok-sse', async (req, res) => {
     setTimeout(() => connect('retry'), wait);
   }
 
-  async function connect(trigger) {
-    if (closed) return;
-    if (tiktok) { try { tiktok.disconnect(); } catch {} tiktok = null; }
+async function connect(trigger) {
+  if (closed) return;
+  if (tiktok) { try { tiktok.disconnect(); } catch {} tiktok = null; }
 
-    send('debug', { stage: 'attempt', user, trigger });
+  send('debug', { stage: 'attempt', user, trigger });
 
-    // Keep your existing options if you had them; this is a safe default.
-    // -- Hardened client fingerprint + headers for TikTok endpoints
-const referer = `https://www.tiktok.com/@${encodeURIComponent(user)}/live`;
-const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
+  // --- Keep your hardened client headers / cookies ---
+  const referer = `https://www.tiktok.com/@${encodeURIComponent(user)}/live`;
+  const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
 
-// Make a lightweight msToken so TikTok doesn’t instantly reject us
-function makeMsToken() {
-  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let t = '';
-  for (let i = 0; i < 107; i++) t += chars[(Math.random() * chars.length) | 0];
-  return t;
-}
-const msToken = makeMsToken();
-
-tiktok = new WebcastPushConnection(user, {
-  enableExtendedGiftInfo: false,
-
-  // Some versions of the lib respect this:
-  userAgent: ua,
-
-  // Querystring-style client params (lib appends them to TikTok URLs)
-  clientParams: {
-    app_language: 'en-US',
-    browser_language: 'en-US',
-    region: 'US',
-    referer,
-    device_platform: 'web',
-    browser_platform: 'Win32',
-    browser_name: 'Mozilla',
-    browser_version: '5.0'
-  },
-
-  // Axios request options used by the library internally
-  requestOptions: {
-    timeout: 15000,
-    headers: {
-      'User-Agent': ua,
-      'Referer': referer,
-      'Origin': 'https://www.tiktok.com',
-      'Accept-Language': 'en-US,en;q=0.9',
-      // A minimal cookie set; msToken is the important one
-      'Cookie': `msToken=${msToken}; tt-web-region=US;`
-    }
+  function makeMsToken() {
+    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    let t = '';
+    for (let i = 0; i < 107; i++) t += chars[(Math.random() * chars.length) | 0];
+    return t;
   }
-});
+  const msToken = makeMsToken();
 
+  tiktok = new WebcastPushConnection(user, {
+    enableExtendedGiftInfo: false,
 
-    // Forward chat
-    tiktok.on('chat', (msg) => {
-      send('chat', {
-        comment: String(msg.comment || ''),
-        uniqueId: msg.uniqueId || '',
-        nickname: msg.nickname || ''
-      });
+    // Some versions read this:
+    userAgent: ua,
+
+    // Query-style params the lib appends
+    clientParams: {
+      app_language: 'en-US',
+      browser_language: 'en-US',
+      region: 'US',
+      referer,
+      device_platform: 'web',
+      browser_platform: 'Win32',
+      browser_name: 'Mozilla',
+      browser_version: '5.0'
+    },
+
+    // Axios options used internally by the lib
+    requestOptions: {
+      timeout: 15000,
+      headers: {
+        'User-Agent': ua,
+        'Referer': referer,
+        'Origin': 'https://www.tiktok.com',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cookie': `msToken=${msToken}; tt-web-region=US;`
+      }
+    }
+  });
+
+  // --- events (unchanged) ---
+  tiktok.on('chat', (msg) => {
+    send('chat', {
+      comment: String(msg.comment || ''),
+      uniqueId: msg.uniqueId || '',
+      nickname: msg.nickname || ''
     });
+  });
 
-    // Robust error forwarding (never stringify as [object Object])
-    const onDisc = () => { send('status', { state: 'disconnected' }); schedule('disconnected'); };
-    const onErr  = (e) => { send('status', { state: 'error', error: serializeErr(e) }); schedule('error'); };
-    const onEnd  = () => { send('status', { state: 'ended' }); schedule('streamEnd'); };
-    tiktok.on('disconnected', onDisc);
-    tiktok.on('error', onErr);
-    tiktok.on('streamEnd', onEnd);
+  const onDisc = () => { send('status', { state: 'disconnected' }); schedule('disconnected'); };
+  const onErr  = (e) => { send('status', { state: 'error', error: serializeErr(e) }); schedule('error'); };
+  const onEnd  = () => { send('status', { state: 'ended' }); schedule('streamEnd'); };
+  tiktok.on('disconnected', onDisc);
+  tiktok.on('error', onErr);
+  tiktok.on('streamEnd', onEnd);
 
-    try {
-      await tiktok.connect();
-      attempt = 0;
-      send('status', { state: 'connected', user });
-      send('open', { ok: true, user });
-    } catch (e) {
-      // Typical offline / blocked cases end up here; report a clean payload
-      send('status', { state: 'error', error: serializeErr(e) });
-      schedule('connect:reject');
+  // --- PRE-FLIGHT: fetch roomId safely to avoid the library’s buggy path ---
+  const abortAfter = (ms) => new Promise((_, rej) => setTimeout(() => rej(new Error('roomId_timeout')), ms));
+  let roomId = null;
+
+  try {
+    if (typeof tiktok.fetchRoomId === 'function') {
+      // v1.2+/v2 API
+      roomId = await Promise.race([ tiktok.fetchRoomId(user), abortAfter(12000) ]);
+    } else if (typeof tiktok.getRoomId === 'function') {
+      // older API name
+      roomId = await Promise.race([ tiktok.getRoomId(user), abortAfter(12000) ]);
+    } else if (tiktok.webClient && tiktok.webClient.fetchRoomInfoFromHtml) {
+      // newer web client route
+      const info = await Promise.race([ tiktok.webClient.fetchRoomInfoFromHtml({ uniqueId: user }), abortAfter(12000) ]);
+      roomId = info && (info.roomId || info.room_id);
     }
+  } catch (e) {
+    send('status', { state: 'error', where: 'roomId', error: serializeErr(e) });
+    return schedule('roomId');
   }
+
+  if (!roomId) {
+    // User likely offline or room not discoverable; avoid calling connect() here
+    send('status', { state: 'offline', user });
+    return schedule('no-room-id');
+  }
+
+  // --- Only connect when we have a valid roomId ---
+  try {
+    await tiktok.connect(roomId);  // bypasses internal roomId scraping
+    attempt = 0;
+    send('status', { state: 'connected', user, roomId });
+    send('open', { ok: true, user, roomId });
+  } catch (e) {
+    send('status', { state: 'error', where: 'connect', error: serializeErr(e) });
+    schedule('connect:reject');
+  }
+}
 
   connect('init');
 });
