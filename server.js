@@ -110,25 +110,66 @@ function extractYouTubeMainByline(markdown, sourceUrl){
 
 function extractTwitchAboutByline(markdown){
   const txt = unwrapJina(markdown);
-  // Split on paragraphs; score for human-ish "About me" text; avoid cookie/legal blobs
-  const BAD = /\b(cookie|cookies|consent|advertis|privacy|policy|analytics|partners|third[- ]party|marketing|targeting|gdpr|do not sell)\b/i;
-  const paras = txt.split(/\n{2,}/)
-    .map(p => p.split('\n').map(s => s.trim()).filter(Boolean).join(' '))
-    .map(stripLinksAndJunk)
-    .filter(Boolean)
-    .filter(p => !BAD.test(p));
+  if (!txt) return '';
 
-  let best = '';
-  let bestScore = -1;
-  for (const p of paras) {
-    const s =
-      (p.length >= 40 && p.length <= 400 ? 60 : 0) +
-      (/[.!?]["']?$/.test(p) ? 10 : 0) +
-      (/\b(i|my|me|we|stream|streaming|live|gaming|videos?|subscribe|follow|community|thank you)\b/i.test(p) ? 25 : 0) +
-      (/\babout\b/i.test(p) ? 10 : 0);
-    if (s > bestScore) { bestScore = s; best = p; }
+  const lines = txt.split('\n');
+
+  // Prefer followers line that appears AFTER the "### About ..." heading
+  let aboutIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^###\s+about\b/i.test(lines[i].trim())) { aboutIdx = i; break; }
   }
-  return clamp100(best);
+
+  let followersIdx = -1;
+  if (aboutIdx !== -1) {
+    for (let i = aboutIdx; i < lines.length; i++) {
+      if (/\bfollowers\b/i.test(lines[i])) { followersIdx = i; break; }
+    }
+  }
+  // Fallback: second "followers" anywhere
+  if (followersIdx === -1) {
+    let hits = 0;
+    for (let i = 0; i < lines.length; i++) {
+      if (/\bfollowers\b/i.test(lines[i])) {
+        hits++;
+        if (hits === 2) { followersIdx = i; break; }
+      }
+    }
+  }
+  if (followersIdx === -1) return '';
+
+  // Walk forward to next meaningful line, skipping CTAs, bullets, link-only lines, headers, "·", and stop at [![ (image panel)
+  const BAD_CTA = /^(follow|following|subscribe|subscribed|gift a sub|gift sub|report|share|chat|send a message|emote[- ]?only|shop|store|block)$/i;
+  const LINK_ONLY = /^\s*(?:\*+\s*)?\[[^\]]+\]\([^)]*\)\s*$/i;
+  const BULLET_LINK = /^\s*\*\s+\[[^\]]+\]\([^)]*\)\s*$/i;
+  const JUST_DOT = /^\s*[·*]+\s*$/;
+  const HEADER_LINE = /^\s*#{1,6}\s+\S/;
+  const IMAGE_LINK = /^\s*\[\!\[/; // [![Image ...]
+
+  for (let i = followersIdx + 1; i < lines.length; i++) {
+    let raw = lines[i].trim();
+    if (!raw) continue;
+    if (IMAGE_LINK.test(raw)) break;
+    if (HEADER_LINE.test(raw)) continue;
+    if (JUST_DOT.test(raw)) continue;
+    if (BULLET_LINK.test(raw)) continue;
+    if (LINK_ONLY.test(raw)) continue;
+    if (BAD_CTA.test(raw)) continue;
+
+    // Clean inline links and bare URLs
+    let cleaned = raw
+      .replace(/\[[^\]]*\]\([^)]*\)/g, ' ')
+      .replace(/\b(?:https?:\/\/|www\.)\S+/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!cleaned || cleaned === '·') continue;
+    if (/^\[\!\[/.test(cleaned)) break;
+
+    return clamp100(cleaned);
+  }
+
+  return '';
 }
 
 function extractGenericByline(markdown){
@@ -209,7 +250,7 @@ app.get('/byline', async (req, res) => {
     if (!r.ok) return res.status(502).type('text/plain').send('Fetch failed');
 
     const md = await r.text();
-    // Twitch raw mode: return FULL about page markdown (no trimming)
+    // Twitch raw=1: return the FULL About page markdown (no cleanup)
     if (/twitch\.tv/i.test(rawUrl) && String(req.query.raw || '') === '1') {
       const fullAbout = unwrapJina(md);
       if (fullAbout) {
