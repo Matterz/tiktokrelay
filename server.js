@@ -45,6 +45,66 @@ const _fetch = (typeof fetch === 'function')
 
 // --- Byline helpers ---------------------------------------------------------
 function escRe(s){ return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// --- Twitch redaction helpers (mask email, links, and handle/partials ≥4 chars) ---
+function twitchUsernameFromUrl(u) {
+  try {
+    const url = new URL(u);
+    const seg = (url.pathname.split('/').filter(Boolean)[0] || '').replace(/^@/, '');
+    return seg || '';
+  } catch {
+    const m = String(u || '').match(/twitch\.tv\/([^\/?#]+)/i);
+    return m ? m[1] : '';
+  }
+}
+
+function twitchRedactionTokens(username) {
+  const out = new Set();
+  const orig = String(username || '');
+  const base = orig.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!base) return [];
+
+  // Full handle
+  out.add(base);
+
+  // Sliding substrings length 4..8 (avoid masking 3-letter words like "the")
+  const maxLen = Math.min(8, base.length);
+  for (let L = maxLen; L >= 4; L--) {
+    for (let i = 0; i + L <= base.length; i++) {
+      out.add(base.slice(i, i + L));
+    }
+  }
+
+  // Also camelCase/number segments length ≥4 (e.g., "Dark", "Viper", "100")
+  const parts = (orig.match(/[A-Z]?[a-z]+|[0-9]+|[A-Z]+(?![a-z])/g) || []).map(s => s.toLowerCase());
+  for (const p of parts) if (p.length >= 4) out.add(p);
+
+  // Longest first to avoid partial-overlap issues
+  return Array.from(out).sort((a, b) => b.length - a.length);
+}
+
+function redactBylineForTwitch(text, sourceUrl) {
+  let out = String(text || '');
+
+  // Emails → ****
+  out = out.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '****');
+
+  // Links/URLs → ****
+  out = out.replace(/\b(?:https?:\/\/|www\.)\S+/gi, '****');
+
+  // Username & partials ≥4 → ****
+  const user = twitchUsernameFromUrl(sourceUrl);
+  if (user) {
+    const toks = twitchRedactionTokens(user);
+    if (toks.length) {
+      const re = new RegExp(toks.map(escRe).join('|'), 'gi');
+      out = out.replace(re, '****');
+    }
+  }
+
+  return out.replace(/\s+/g, ' ').trim();
+}
+
 function unwrapJina(md){
   if (!md) return '';
   let t = String(md).replace(/\r\n/g, '\n');
@@ -143,8 +203,7 @@ function extractYouTubeMainByline(markdown, sourceUrl){
   return clamp100(body);
 }
 
-
-function extractTwitchAboutByline(markdown){
+function extractTwitchAboutByline(markdown, sourceUrl){
   const txt = unwrapJina(markdown);
   // Split on paragraphs; score for human-ish "About me" text; avoid cookie/legal blobs
   const BAD = /\b(cookie|cookies|consent|advertis|privacy|policy|analytics|partners|third[- ]party|marketing|targeting|gdpr|do not sell)\b/i;
@@ -164,7 +223,10 @@ function extractTwitchAboutByline(markdown){
       (/\babout\b/i.test(p) ? 10 : 0);
     if (s > bestScore) { bestScore = s; best = p; }
   }
-  return clamp100(best);
+
+  // NEW: redact emails/links/handle (incl. partials ≥4) before returning
+  const masked = redactBylineForTwitch(best, sourceUrl);
+  return clamp100(masked);
 }
 
 function extractGenericByline(markdown){
@@ -193,7 +255,7 @@ function extractGenericByline(markdown){
 function extractBylineFor(url, markdown){
   const u = String(url || '').toLowerCase();
   if (/youtube\.com/.test(u))   return extractYouTubeMainByline(markdown, url);
-  if (/twitch\.tv/.test(u))     return extractTwitchAboutByline(markdown);
+  if (/twitch\.tv/.test(u))     return extractTwitchAboutByline(markdown, url);
   return extractGenericByline(markdown);
 }
 
