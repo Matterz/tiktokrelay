@@ -259,16 +259,6 @@ function extractBylineFor(url, markdown){
   return extractGenericByline(markdown);
 }
 
-/* ----------------------------- CORS (global) ----------------------------- */
-/* Allow the browser to call these endpoints from any origin (Bluehost, etc.) */
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET,OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, X-Requested-With');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
-});
-
 /* ------------------------------ Healthcheck ------------------------------ */
 app.get('/', (_req, res) => res.type('text/plain').send('TikTok SSE relay & Byline proxy OK'));
 
@@ -313,6 +303,10 @@ app.get('/byline', async (req, res) => {
     }
 
     const md = await r.text();
+	
+	// Avoid huge strings causing memory spikes
+	if (md.length > 400_000) md = md.slice(0, 400_000);
+
     const byline = extractBylineFor(rawUrl, md);
 
     if (!byline) {
@@ -460,62 +454,48 @@ function structureMarkdown(md) {
 }
 
 // GET /twitch-about?u=<twitch-channel-url>
-// Returns JSON: { sourceUrl, format: "markdown", markdown, headings[], lines[] }
+// Returns JSON: { sourceUrl, format: "markdown", markdown, fetchedAt }
 app.get('/twitch-about', async (req, res) => {
-  // inside your /twitch-about handler:
-const r = await _fetch(jinaUrl, {
-  method: 'GET',
-  headers: {
-    'User-Agent': 'Mozilla/5.0 (compatible; RelayBot/1.0)',
-    'Accept': 'text/plain,*/*;q=0.8'
-  },
-  redirect: 'follow'
-});
-
   try {
+    setCORS(req, res);
+
     const rawU = String(req.query.u || '').trim();
     if (!rawU || !isTwitchUrl(rawU)) {
-      res.setHeader('Access-Control-Allow-Origin', '*');
       return res.status(400).json({ error: 'Provide ?u= with a twitch.tv URL' });
     }
 
     const sourceUrl = normalizeTwitchAboutUrl(rawU);
     const jinaUrl = 'https://r.jina.ai/http://' + sourceUrl.replace(/^https?:\/\//i, '');
 
-    const { signal, cancel } = timeoutSignal(12000);
-    const r = await fetch(jinaUrl, {
+    const r = await _fetch(jinaUrl, {
       method: 'GET',
       headers: {
         'User-Agent': 'Mozilla/5.0 (compatible; RelayBot/1.0)',
         'Accept': 'text/plain,*/*;q=0.8'
       },
-      redirect: 'follow',
-      signal
-    }).catch((e) => ({ ok: false, status: 599, _err: e }));
-    cancel();
+      redirect: 'follow'
+    });
 
-    res.setHeader('Access-Control-Allow-Origin', '*');
-
-    if (!r || !r.ok) {
-      return res.status(502).json({ error: 'upstream_unavailable', status: r && r.status });
+    if (!r.ok) {
+      return res.status(502).json({ error: 'upstream_unavailable', status: r.status });
     }
 
-    const rawText = await r.text();
-    const markdown = extractMarkdownSection(rawText);
-    const { headings, lines } = structureMarkdown(markdown);
+    let rawText = await r.text();
+    let markdown = extractMarkdownSection(rawText);
+
+    // (Optional safety) cap extremely large responses to avoid memory spikes
+    if (markdown.length > 400_000) markdown = markdown.slice(0, 400_000);
 
     return res.status(200).json({
       sourceUrl,
       fetchedFrom: 'jina',
       format: 'markdown',
       markdown,
-      headings,
-      lines,
       fetchedAt: new Date().toISOString()
     });
   } catch (e) {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    return res.status(200).json({ sourceUrl: null, format: 'markdown', markdown: '' }); // fail-soft
+    setCORS(req, res);
+    return res.status(503).json({ error: 'twitch_about_unavailable' });
   }
 });
 
