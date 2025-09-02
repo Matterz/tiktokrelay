@@ -9,6 +9,66 @@ const app = express();
 
 // --- Byline helpers ---------------------------------------------------------
 function escRe(s){ return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// Build redaction tokens from a Twitch username (mask partials too).
+function twitchRedactionTokens(username) {
+  const out = new Set();
+  const orig = String(username || '');
+  const base = orig.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!base) return [];
+
+  out.add(base); // full
+
+  // Split on camelCase/number and underscores
+  const parts = (orig.match(/[A-Z]?[a-z]+|[0-9]+|[A-Z]+(?![a-z])/g) || []).map(s => s.toLowerCase());
+  for (const p of parts) if (p.length >= 4) out.add(p);
+
+  // Add sliding substrings of the base (length 5..8) to catch partials like "darkviper"
+  for (let L = Math.min(8, base.length); L >= 5; L--) {
+    for (let i = 0; i + L <= base.length; i++) {
+      out.add(base.slice(i, i + L));
+    }
+    if (out.size > 64) break; // cap
+  }
+
+  // Sort longest first to avoid partial overlap issues
+  return Array.from(out).sort((a, b) => b.length - a.length);
+}
+
+function twitchUsernameFromUrl(u) {
+  try {
+    const url = new URL(u);
+    const seg = (url.pathname.split('/').filter(Boolean)[0] || '').replace(/^@/, '');
+    return seg || '';
+  } catch {
+    const m = String(u || '').match(/twitch\.tv\/([^\/?#]+)/i);
+    return m ? m[1] : '';
+  }
+}
+
+// Redact: emails, links, and username (including partials) from a byline
+function redactBylineForTwitch(text, url) {
+  let out = String(text || '');
+
+  // Emails → ****
+  out = out.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '****');
+
+  // Links/URLs → ****
+  out = out.replace(/\b(?:https?:\/\/|www\.)\S+/gi, '****');
+
+  // Username tokens → ****
+  const user = twitchUsernameFromUrl(url);
+  if (user) {
+    const toks = twitchRedactionTokens(user);
+    if (toks.length) {
+      const re = new RegExp(toks.map(t => escRe(t)).join('|'), 'gi');
+      out = out.replace(re, '****');
+    }
+  }
+
+  // Collapse whitespace
+  return out.replace(/\s+/g, ' ').trim();
+}
 function unwrapJina(md){
   if (!md) return '';
   let t = String(md).replace(/\r\n/g, '\n');
@@ -108,7 +168,7 @@ function extractYouTubeMainByline(markdown, sourceUrl){
 }
 
 
-function extractTwitchAboutByline(markdown){
+function extractTwitchAboutByline(markdown, sourceUrl){
   const txt = unwrapJina(markdown);
   if (!txt) return '';
 
@@ -166,6 +226,7 @@ function extractTwitchAboutByline(markdown){
     if (!cleaned || cleaned === '·') continue;
     if (/^\[\!\[/.test(cleaned)) break;
 
+    cleaned = redactBylineForTwitch(cleaned, sourceUrl);
     return clamp100(cleaned);
   }
 
@@ -198,7 +259,7 @@ function extractGenericByline(markdown){
 function extractBylineFor(url, markdown){
   const u = String(url || '').toLowerCase();
   if (/youtube\.com/.test(u))   return extractYouTubeMainByline(markdown, url);
-  if (/twitch\.tv/.test(u))     return extractTwitchAboutByline(markdown);
+  if (/twitch\.tv/.test(u))     return extractTwitchAboutByline(markdown, url);
   return extractGenericByline(markdown);
 }
 
