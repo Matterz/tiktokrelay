@@ -678,22 +678,23 @@ try {
   tiktok.on('error', onErr);
   tiktok.on('streamEnd', onEnd);
 
-	// Prime the connector with the known roomId (if the property exists on this version)
-	try { if ('roomId' in tiktok) { tiktok.roomId = roomId; } } catch {}
-
+	// --- Connect using discovered roomId (prefer explicit first) ---
 	try {
-	  // Primary: call connect() with NO args (uses primed roomId + our forced headers)
-	  await tiktok.connect();
+	  // Prime any known fields versions use internally
+	  try { if ('roomId' in tiktok) tiktok.roomId = roomId; } catch {}
+	  try { if ('uniqueId' in tiktok) tiktok.uniqueId = user; } catch {}
+
+	  // 1) Try explicit connect(roomId) FIRST (avoids the library's internal room fetch)
+	  await tiktok.connect(roomId);
 	  attempt = 0;
 	  send('status', { state: 'connected', user, roomId });
 	  send('open', { ok: true, user, roomId });
 	} catch (e1) {
-	  // Fallback once: drop Host override and try explicit connect(roomId)
 	  const err1 = serializeErr(e1);
 	  send('status', { state: 'error', where: 'connect:first', error: err1 });
 
 	  try {
-		// Remove the Host override from both axios clients
+		// 2) Drop Host override (some edges dislike it), retry connect(roomId)
 		try {
 		  if (tiktok.http?.defaults?.headers) {
 			delete tiktok.http.defaults.headers.Host;
@@ -712,11 +713,21 @@ try {
 		send('status', { state: 'connected', user, roomId });
 		send('open', { ok: true, user, roomId });
 	  } catch (e2) {
-		send('status', { state: 'error', where: 'connect:fallback', error: serializeErr(e2) });
-		schedule('connect:reject');
+		// 3) Last resort: let the library try its own lookup (connect() with no args)
+		const err2 = serializeErr(e2);
+		send('status', { state: 'error', where: 'connect:second', error: err2 });
+
+		try {
+		  await tiktok.connect();
+		  attempt = 0;
+		  send('status', { state: 'connected', user, roomId });
+		  send('open', { ok: true, user, roomId });
+		} catch (e3) {
+		  send('status', { state: 'error', where: 'connect:final', error: serializeErr(e3) });
+		  schedule('connect:reject');
+		}
 	  }
 	}
-
 }
 
   connect('init');
