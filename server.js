@@ -535,8 +535,9 @@ async function connect(trigger) {
   send('debug', { stage: 'attempt', user, trigger });
 
   // --- Client fingerprint / headers ---
+// --- Client fingerprint / headers ---
 const referer = `https://www.tiktok.com/@${encodeURIComponent(user)}/live`;
-const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
+const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36';
 
 function makeMsToken() {
   const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
@@ -551,7 +552,18 @@ const baseHeaders = {
   'User-Agent': ua,
   'Referer': referer,
   'Origin': 'https://www.tiktok.com',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+
+  // IMPORTANT: modern hint headers to avoid 4xx on webcast endpoints
+  'sec-ch-ua': '"Chromium";v="126", "Not.A/Brand";v="24", "Google Chrome";v="126"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Windows"',
+
+  'Sec-Fetch-Site': 'same-site',
+  'Sec-Fetch-Mode': 'cors',
+  'Sec-Fetch-Dest': 'empty',
+
+  // Typical accept set used by the site
+  'Accept': 'application/json, text/plain, */*',
   'Accept-Language': 'en-US,en;q=0.9'
 };
 
@@ -588,30 +600,33 @@ const commonHeaders = {
   }
 
   // --- Build the connector AFTER we have a room id
-  tiktok = new WebcastPushConnection(user, {
-    enableExtendedGiftInfo: false,
+tiktok = new WebcastPushConnection(user, {
+  enableExtendedGiftInfo: false,
 
-    // Some versions read this:
-    userAgent: ua,
+  // Some versions read this:
+  userAgent: ua,
 
-    // Query params appended by the lib
-    clientParams: {
-      app_language: 'en-US',
-      browser_language: 'en-US',
-      region: 'US',
-      referer,
-      device_platform: 'web',
-      browser_platform: 'Win32',
-      browser_name: 'Mozilla',
-      browser_version: '5.0'
-    },
+  // Query params appended to the internal HTTP calls
+  clientParams: {
+    app_language: 'en-US',
+    browser_language: 'en-US',
+    region: 'US',
+    referer,
+    device_platform: 'web',
+    browser_platform: 'Win32',
+    browser_name: 'Mozilla',
+    browser_version: '5.0',
+    // IMPORTANT: include msToken as a query param too
+    msToken
+  },
 
-    // Axios request options used internally
-    requestOptions: {
-      timeout: 15000,
-      headers: commonHeaders
-    }
-  });
+  // Axios request options used internally
+  requestOptions: {
+    timeout: 15000,
+    withCredentials: true,          // ensure cookies are actually sent
+    headers: commonHeaders          // includes msToken + ttwid/odin_tt cookies
+  }
+});
 
   // --- events (unchanged)
   tiktok.on('chat', (msg) => {
