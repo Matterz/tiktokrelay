@@ -10,6 +10,37 @@ const app = express();
 // --- Byline helpers ---------------------------------------------------------
 function escRe(s){ return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
+// --- CORS (allow your Bluehost domain + localhost) ---
+const ALLOW_ORIGINS = new Set([
+  'https://keyguessing.com',
+  'https://www.keyguessing.com',
+  'http://localhost:3000',
+  'http://127.0.0.1:5500',
+  'http://localhost:8080'
+]);
+
+function corsMiddleware(req, res, next) {
+  const origin = req.headers.origin;
+  if (origin && (ALLOW_ORIGINS.has(origin))) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  } else {
+    // Safe default for simple GETs (no credentials)
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  }
+
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+
+  if (req.method === 'OPTIONS') {
+    res.statusCode = 204;
+    return res.end();
+  }
+  next();
+}
+
+app.use(corsMiddleware);
+
 // Build redaction tokens from a Twitch username (mask partials too).
 function twitchRedactionTokens(username) {
   const out = new Set();
@@ -331,94 +362,77 @@ app.get('/byline', async (req, res) => {
   }
 });
 
-/* ------------------------------ TikTok SSE ------------------------------- */
-/** SSE endpoint: /tiktok-sse?user=keyaogames */
+// --- TikTok SSE (REPLACE YOUR EXISTING HANDLER WITH THIS) ---
 app.get('/tiktok-sse', async (req, res) => {
-  const user = String(req.query.user || '').trim().toLowerCase();
-  if (!user) return res.status(400).json({ error: 'Missing ?user=' });
+  try {
+    // CORS (global middleware already set these, but keeping essentials here too)
+    const origin = req.headers.origin;
+    if (origin && ALLOW_ORIGINS.has(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+    } else {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+    }
 
-  // SSE headers
-  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('Access-Control-Allow-Origin', '*');
+    // SSE headers
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform'); // avoid proxy transformations
+    res.setHeader('X-Accel-Buffering', 'no');                 // disable nginx buffering if present
+    res.setHeader('Connection', 'keep-alive');
 
-  // keep-alive ping so proxies don’t close the stream
-  const keepAlive = setInterval(() => res.write(':\n\n'), 15000);
+    if (typeof res.flushHeaders === 'function') {
+      res.flushHeaders(); // send headers immediately
+    }
 
-  // backoff for reconnects when not live yet
-  const delays = [2000, 5000, 10000, 20000, 30000, 60000];
-  let attempt = 0;
-  let tiktok = null;
-  let closed = false;
+    // Helper to write SSE frames safely
+    const send = (event, dataObj) => {
+      try {
+        if (event) res.write(`event: ${event}\n`);
+        const payload = (typeof dataObj === 'string') ? dataObj : JSON.stringify(dataObj || {});
+        res.write(`data: ${payload}\n\n`);
+      } catch (_) { /* socket probably closed */ }
+    };
 
-  const cleanup = () => {
-    clearInterval(keepAlive);
-    try { tiktok && tiktok.disconnect(); } catch {}
-  };
+    // Initial status breadcrumb to help your client know we’re up
+    send('status', { state: 'connected', ts: Date.now() });
 
-  req.on('close', () => { closed = true; cleanup(); });
+    // Keep-alive ping (prevents idle intermediaries from closing the stream)
+    const keepAlive = setInterval(() => {
+      try { res.write(': keep-alive\n\n'); } catch (_) {}
+    }, 15000);
 
-  function writeEvent(event, data) {
-    try {
-      res.write(`event: ${event}\n`);
-      res.write(`data: ${JSON.stringify(data)}\n\n`);
-    } catch {}
-  }
+    // ---- your existing TikTok connection logic goes here ----
+    // When you receive a chat payload, do:  send('chat', chatPayload);
 
-  function errPayload(e) {
-    if (!e) return { message: 'unknown' };
-    const out = { message: e.message || String(e) };
-    if (e.code) out.code = e.code;
-    if (e.statusCode) out.statusCode = e.statusCode;
-    if (e.status) out.status = e.status;
-    return out;
-  }
+    // Example skeleton — keep your current implementation if you already have one:
+    const username = String(req.query.user || '').trim().toLowerCase();
+    if (!username) {
+      send('debug', { error: 'missing username param ?user=' });
+      clearInterval(keepAlive);
+      return res.end();
+    }
 
-  async function connect(trigger) {
-    if (closed) return;
-    if (tiktok) { try { tiktok.disconnect(); } catch {} tiktok = null; }
+    // TODO: plug in your actual TikTok connector; on chat message: send('chat', {...})
+    // For example:
+    // connector.on('chat', (msg) => send('chat', msg));
+    // connector.on('status', (s) => send('status', s));
 
-    writeEvent('debug', { stage: 'attempt', user, trigger });
-
-    tiktok = new WebcastPushConnection(user, { enableExtendedGiftInfo: false });
-
-    // forward chat messages
-    tiktok.on('chat', (msg) => {
-      writeEvent('chat', {
-        comment: String(msg.comment || ''),
-        uniqueId: msg.uniqueId || '',
-        nickname: msg.nickname || ''
-      });
+    // Tidy up on client disconnect
+    req.on('close', () => {
+      clearInterval(keepAlive);
+      try {
+        // connector && connector.disconnect();
+      } catch(_) {}
+      try { res.end(); } catch(_) {}
     });
 
-    // reconnect cases — include details so the client can display them
-    const onDisc = () => { writeEvent('status', { state: 'disconnected' }); schedule('disconnected'); };
-    const onErr  = (e) => { writeEvent('status', { state: 'error', ...errPayload(e) }); schedule('error'); };
-    const onEnd  = () => { writeEvent('status', { state: 'ended' }); schedule('streamEnd'); };
-    tiktok.on('disconnected', onDisc);
-    tiktok.on('error', onErr);
-    tiktok.on('streamEnd', onEnd);
-
+  } catch (err) {
     try {
-      await tiktok.connect();
-      attempt = 0; // reset backoff
-      writeEvent('status', { state: 'connected', user });
-      writeEvent('open', { ok: true, user });
-    } catch (e) {
-      writeEvent('status', { state: 'error', ...errPayload(e) });
-      schedule('connect:reject');
-    }
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.statusCode = 500;
+      res.end(JSON.stringify({ error: 'sse_init_failed', detail: String(err) }));
+    } catch (_) {}
   }
-
-  function schedule(reason) {
-    if (closed) return;
-    const wait = delays[Math.min(attempt++, delays.length - 1)];
-    writeEvent('debug', { stage: 'retry', user, inMs: wait, reason });
-    setTimeout(() => connect('retry'), wait);
-  }
-
-  connect('init');
 });
 
 // --- Twitch-only helpers for full About page proxy ---
