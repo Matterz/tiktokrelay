@@ -384,6 +384,53 @@ function serializeErr(e) {
   }
 }
 
+// Robustly scrape a TikTok @user page to find a live roomId
+async function scrapeRoomIdFromWebProfile(user, headers) {
+  const urlLive = `https://www.tiktok.com/@${encodeURIComponent(user)}/live`;
+  const urlHome = `https://www.tiktok.com/@${encodeURIComponent(user)}`;
+
+  async function grab(url) {
+    const r = await _fetch(url, { method: 'GET', headers, redirect: 'follow' });
+    const text = await r.text();
+    return { ok: r.ok, text, status: r.status };
+  }
+
+  // Try /live first, then fallback to the main profile
+  for (const url of [urlLive, urlHome]) {
+    try {
+      const { ok, text } = await grab(url);
+      if (!ok || !text) continue;
+
+      // quick regex hits
+      let m = text.match(/"roomId":"(\d+)"/) || text.match(/"room_id":"(\d+)"/);
+      if (m) return { roomId: m[1], isLive: true };
+
+      // try extracting the SIGI_STATE JSON blob
+      const sigi = text.match(/<script[^>]+id="SIGI_STATE"[^>]*>([\s\S]*?)<\/script>/);
+      if (sigi) {
+        try {
+          const json = JSON.parse(sigi[1]);
+          let rid =
+            json?.LiveRoom?.liveRoomId ||
+            json?.LiveRoom?.roomId ||
+            json?.RoomStore?.roomId ||
+            null;
+
+          if (!rid) {
+            // brute force a last try over the json string
+            const s = JSON.stringify(json);
+            const mm = s.match(/"roomId":"(\d+)"/) || s.match(/"room_id":"(\d+)"/);
+            if (mm) rid = mm[1];
+          }
+          if (rid) return { roomId: String(rid), isLive: true };
+        } catch { /* ignored */ }
+      }
+    } catch { /* ignored */ }
+  }
+
+  return { roomId: null, isLive: false };
+}
+
 app.get('/tiktok-sse', async (req, res) => {
   setCORS(req, res);
 
@@ -431,7 +478,7 @@ async function connect(trigger) {
 
   send('debug', { stage: 'attempt', user, trigger });
 
-  // --- Keep your hardened client headers / cookies ---
+  // --- Client fingerprint / headers ---
   const referer = `https://www.tiktok.com/@${encodeURIComponent(user)}/live`;
   const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
 
@@ -443,13 +490,39 @@ async function connect(trigger) {
   }
   const msToken = makeMsToken();
 
+  const commonHeaders = {
+    'User-Agent': ua,
+    'Referer': referer,
+    'Origin': 'https://www.tiktok.com',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Cookie': `msToken=${msToken}; tt-web-region=US;`
+  };
+
+  // --- Pre-scrape roomId from public web page to avoid library’s brittle path
+  let roomId = null;
+  try {
+    const scraped = await scrapeRoomIdFromWebProfile(user, commonHeaders);
+    if (scraped && scraped.roomId) {
+      roomId = scraped.roomId;
+      send('room', { user, roomId, isLive: true });
+    } else {
+      // We couldn’t find a room id — either offline or blocked from scraping
+      send('status', { state: 'offline', user });
+      return schedule('no-room-id');
+    }
+  } catch (e) {
+    send('status', { state: 'error', where: 'scrape', error: serializeErr(e) });
+    return schedule('scrape');
+  }
+
+  // --- Build the connector AFTER we have a room id
   tiktok = new WebcastPushConnection(user, {
     enableExtendedGiftInfo: false,
 
     // Some versions read this:
     userAgent: ua,
 
-    // Query-style params the lib appends
+    // Query params appended by the lib
     clientParams: {
       app_language: 'en-US',
       browser_language: 'en-US',
@@ -461,20 +534,14 @@ async function connect(trigger) {
       browser_version: '5.0'
     },
 
-    // Axios options used internally by the lib
+    // Axios request options used internally
     requestOptions: {
       timeout: 15000,
-      headers: {
-        'User-Agent': ua,
-        'Referer': referer,
-        'Origin': 'https://www.tiktok.com',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cookie': `msToken=${msToken}; tt-web-region=US;`
-      }
+      headers: commonHeaders
     }
   });
 
-  // --- events (unchanged) ---
+  // --- events (unchanged)
   tiktok.on('chat', (msg) => {
     send('chat', {
       comment: String(msg.comment || ''),
@@ -482,7 +549,6 @@ async function connect(trigger) {
       nickname: msg.nickname || ''
     });
   });
-
   const onDisc = () => { send('status', { state: 'disconnected' }); schedule('disconnected'); };
   const onErr  = (e) => { send('status', { state: 'error', error: serializeErr(e) }); schedule('error'); };
   const onEnd  = () => { send('status', { state: 'ended' }); schedule('streamEnd'); };
@@ -490,36 +556,9 @@ async function connect(trigger) {
   tiktok.on('error', onErr);
   tiktok.on('streamEnd', onEnd);
 
-  // --- PRE-FLIGHT: fetch roomId safely to avoid the library’s buggy path ---
-  const abortAfter = (ms) => new Promise((_, rej) => setTimeout(() => rej(new Error('roomId_timeout')), ms));
-  let roomId = null;
-
+  // --- Connect using discovered roomId (skips library’s internal discovery)
   try {
-    if (typeof tiktok.fetchRoomId === 'function') {
-      // v1.2+/v2 API
-      roomId = await Promise.race([ tiktok.fetchRoomId(user), abortAfter(12000) ]);
-    } else if (typeof tiktok.getRoomId === 'function') {
-      // older API name
-      roomId = await Promise.race([ tiktok.getRoomId(user), abortAfter(12000) ]);
-    } else if (tiktok.webClient && tiktok.webClient.fetchRoomInfoFromHtml) {
-      // newer web client route
-      const info = await Promise.race([ tiktok.webClient.fetchRoomInfoFromHtml({ uniqueId: user }), abortAfter(12000) ]);
-      roomId = info && (info.roomId || info.room_id);
-    }
-  } catch (e) {
-    send('status', { state: 'error', where: 'roomId', error: serializeErr(e) });
-    return schedule('roomId');
-  }
-
-  if (!roomId) {
-    // User likely offline or room not discoverable; avoid calling connect() here
-    send('status', { state: 'offline', user });
-    return schedule('no-room-id');
-  }
-
-  // --- Only connect when we have a valid roomId ---
-  try {
-    await tiktok.connect(roomId);  // bypasses internal roomId scraping
+    await tiktok.connect(roomId);
     attempt = 0;
     send('status', { state: 'connected', user, roomId });
     send('open', { ok: true, user, roomId });
