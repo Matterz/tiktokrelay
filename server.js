@@ -326,7 +326,7 @@ app.get('/byline', async (req, res) => {
       return res.status(502).type('text/plain').send('Fetch failed');
     }
 
-    const md = await r.text();
+    let md = await r.text();
 	
 	// Avoid huge strings causing memory spikes
 	if (md.length > 400_000) md = md.slice(0, 400_000);
@@ -607,10 +607,8 @@ const webcastHeaders = {
     return schedule('scrape');
   }
 
-  // --- Build the connector AFTER we have a room id
 tiktok = new WebcastPushConnection(user, {
   enableExtendedGiftInfo: false,
-  headers: webcastHeaders
 
   // Some versions read this:
   userAgent: ua,
@@ -625,17 +623,17 @@ tiktok = new WebcastPushConnection(user, {
     browser_platform: 'Win32',
     browser_name: 'Mozilla',
     browser_version: '5.0',
-    // IMPORTANT: send msToken in query too
     msToken
   },
 
   // Axios request options used internally
   requestOptions: {
     timeout: 15000,
-    withCredentials: true,          // ensure cookies are actually sent
-    headers: commonHeaders          // includes msToken + ttwid/odin_tt cookies
+    withCredentials: true,
+    headers: webcastHeaders   // <- use the webcast host override here
   }
 });
+
 
 // Force our headers/cookies into the connector’s internal axios instances
 try {
