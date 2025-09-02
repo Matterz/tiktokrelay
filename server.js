@@ -448,8 +448,7 @@ async function getTikTokCookieHeader(user, baseHeaders) {
   return parts.join('; ');
 }
 
-
-// Robustly scrape a TikTok @user page to find a live roomId
+// Robustly scrape a TikTok @user page to find a current live roomId (validated)
 async function scrapeRoomIdFromWebProfile(user, headers) {
   const urlLive = `https://www.tiktok.com/@${encodeURIComponent(user)}/live`;
   const urlHome = `https://www.tiktok.com/@${encodeURIComponent(user)}`;
@@ -460,41 +459,87 @@ async function scrapeRoomIdFromWebProfile(user, headers) {
     return { ok: r.ok, text, status: r.status };
   }
 
-  // Try /live first, then fallback to the main profile
+  // Try /live, then /@user
   for (const url of [urlLive, urlHome]) {
     try {
       const { ok, text } = await grab(url);
       if (!ok || !text) continue;
 
-      // quick regex hits
-      let m = text.match(/"roomId":"(\d+)"/) || text.match(/"room_id":"(\d+)"/);
-      if (m) return { roomId: m[1], isLive: true };
-
-      // try extracting the SIGI_STATE JSON blob
+      // SIGI_STATE JSON blob usually has the LiveRoom info
       const sigi = text.match(/<script[^>]+id="SIGI_STATE"[^>]*>([\s\S]*?)<\/script>/);
       if (sigi) {
         try {
           const json = JSON.parse(sigi[1]);
-          let rid =
+
+          // Look for an explicit flag that the user is live
+          const liveRoomId =
             json?.LiveRoom?.liveRoomId ||
             json?.LiveRoom?.roomId ||
             json?.RoomStore?.roomId ||
             null;
 
-          if (!rid) {
-            // brute force a last try over the json string
-            const s = JSON.stringify(json);
-            const mm = s.match(/"roomId":"(\d+)"/) || s.match(/"room_id":"(\d+)"/);
-            if (mm) rid = mm[1];
+          const liveFlag =
+            json?.LiveRoom?.isLive === true ||
+            json?.LiveRoom?.status === 1 ||
+            json?.LiveRoom?.status === 2 ||
+            json?.UserLiveState?.isLive === true ||
+            null;
+
+          if (liveRoomId) {
+            // Double-check with webcast API to avoid stale IDs
+            const check = await getWebcastRoomStatus(liveRoomId, { ...headers, Host: 'webcast.tiktok.com' });
+            if (check.live) return { roomId: String(liveRoomId), isLive: true };
           }
-          if (rid) return { roomId: String(rid), isLive: true };
-        } catch { /* ignored */ }
+
+          // No validated live room; fall through to try a regex, then validate again
+          const mm = (JSON.stringify(json).match(/"roomId":"(\d+)"/) || JSON.stringify(json).match(/"room_id":"(\d+)"/));
+          const rid = mm ? mm[1] : null;
+          if (rid) {
+            const check = await getWebcastRoomStatus(rid, { ...headers, Host: 'webcast.tiktok.com' });
+            if (check.live) return { roomId: String(rid), isLive: true };
+          }
+        } catch { /* ignore parse errors and continue */ }
       }
-    } catch { /* ignored */ }
+
+      // Fast path: sometimes the HTML directly contains a current "roomId"
+      const m = text.match(/"roomId":"(\d+)"/) || text.match(/"room_id":"(\d+)"/);
+      if (m) {
+        const rid = m[1];
+        const check = await getWebcastRoomStatus(rid, { ...headers, Host: 'webcast.tiktok.com' });
+        if (check.live) return { roomId: String(rid), isLive: true };
+      }
+    } catch { /* ignore and try next */ }
   }
 
+  // If we get here, we couldn't validate any live room
   return { roomId: null, isLive: false };
 }
+
+// Check if a roomId is actually live via the webcast API
+async function getWebcastRoomStatus(roomId, headers) {
+  try {
+    const url = `https://webcast.tiktok.com/webcast/room/info/?aid=1988&room_id=${encodeURIComponent(roomId)}`;
+    const r = await _fetch(url, {
+      method: 'GET',
+      headers: { ...headers, Host: 'webcast.tiktok.com', Accept: 'application/json, text/plain, */*' },
+      redirect: 'follow'
+    });
+    const data = await r.json().catch(() => null);
+    // Look for status in common places
+    const status =
+      data?.data?.room_info?.status ??
+      data?.roomInfo?.status ??
+      data?.room?.status ??
+      null;
+
+    // Treat 1 or 2 as "live" (values vary by edge), anything else = offline
+    const live = [1, 2].includes(Number(status));
+    return { live, status, rawOk: r.ok };
+  } catch (e) {
+    return { live: false, status: null, error: String(e && e.message || e) };
+  }
+}
+
 
 app.get('/tiktok-sse', async (req, res) => {
   setCORS(req, res);
@@ -620,14 +665,15 @@ const webcastHeaders = {
   let roomId = null;
   try {
     const scraped = await scrapeRoomIdFromWebProfile(user, commonHeaders);
-    if (scraped && scraped.roomId) {
-      roomId = scraped.roomId;
-      send('room', { user, roomId, isLive: true });
-    } else {
-      // We couldn’t find a room id — either offline or blocked from scraping
-      send('status', { state: 'offline', user });
-      return schedule('no-room-id');
-    }
+	if (!scraped || !scraped.roomId || scraped.isLive === false) {
+	  send('room', { user, isLive: false });
+	  send('status', { state: 'offline', user });
+	  return schedule('no-live');
+	}
+
+	roomId = scraped.roomId;
+	send('room', { user, roomId, isLive: true });
+
   } catch (e) {
     send('status', { state: 'error', where: 'scrape', error: serializeErr(e) });
     return schedule('scrape');
