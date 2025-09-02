@@ -623,7 +623,8 @@ tiktok = new WebcastPushConnection(user, {
     browser_platform: 'Win32',
     browser_name: 'Mozilla',
     browser_version: '5.0',
-    msToken
+    msToken,
+	room_id: roomId
   },
 
   // Axios request options used internally
@@ -685,7 +686,7 @@ try {
 	  try { if ('uniqueId' in tiktok) tiktok.uniqueId = user; } catch {}
 
 	  // 1) Try explicit connect(roomId) FIRST (avoids the library's internal room fetch)
-	  await tiktok.connect(roomId);
+	  await tiktok.connect({ roomId });
 	  attempt = 0;
 	  send('status', { state: 'connected', user, roomId });
 	  send('open', { ok: true, user, roomId });
@@ -708,7 +709,7 @@ try {
 		  }
 		} catch {}
 
-		await tiktok.connect(roomId);
+		await tiktok.connect({ roomId });
 		attempt = 0;
 		send('status', { state: 'connected', user, roomId });
 		send('open', { ok: true, user, roomId });
