@@ -717,6 +717,7 @@ try {
   send('status', { state: 'error', where: 'connect', error: serializeErr(e) });
   schedule('connect:reject');
 }
+}
   connect('init');
 });
 
