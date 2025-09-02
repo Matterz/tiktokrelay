@@ -680,55 +680,76 @@ try {
   tiktok.on('streamEnd', onEnd);
 
 	// --- Connect using discovered roomId (prefer explicit first) ---
-	try {
-	  // Prime any known fields versions use internally
-	  try { if ('roomId' in tiktok) tiktok.roomId = roomId; } catch {}
-	  try { if ('uniqueId' in tiktok) tiktok.uniqueId = user; } catch {}
+	// --- Connect using discovered roomId (force-bypass the lib’s room lookup) ---
 
-	  // 1) Try explicit connect(roomId) FIRST (avoids the library's internal room fetch)
-	  await tiktok.connect({ roomId });
-	  attempt = 0;
-	  send('status', { state: 'connected', user, roomId });
-	  send('open', { ok: true, user, roomId });
-	} catch (e1) {
-	  const err1 = serializeErr(e1);
-	  send('status', { state: 'error', where: 'connect:first', error: err1 });
+// 0) Prime some fields the lib reads internally
+try { if ('roomId' in tiktok) tiktok.roomId = String(roomId); } catch {}
+try { if ('uniqueId' in tiktok) tiktok.uniqueId = user; } catch {}
 
-	  try {
-		// 2) Drop Host override (some edges dislike it), retry connect(roomId)
-		try {
-		  if (tiktok.http?.defaults?.headers) {
-			delete tiktok.http.defaults.headers.Host;
-			if (tiktok.http.defaults.headers.common) delete tiktok.http.defaults.headers.common.Host;
-		  }
-		} catch {}
-		try {
-		  if (tiktok.webcastClient?.http?.defaults?.headers) {
-			delete tiktok.webcastClient.http.defaults.headers.Host;
-			if (tiktok.webcastClient.http.defaults.headers.common) delete tiktok.webcastClient.http.defaults.headers.common.Host;
-		  }
-		} catch {}
+// 1) Monkey-patch the private retrievers to always return our scraped roomId
+try {
+  if (typeof tiktok._retrieveRoomId2 === 'function') {
+    tiktok._retrieveRoomId2 = async () => String(roomId);
+  }
+  if (typeof tiktok._retrieveRoomId === 'function') {
+    tiktok._retrieveRoomId = async () => String(roomId);
+  }
+  // Some builds go through the webClient HTML fetcher on connect()
+  if (tiktok.webClient && typeof tiktok.webClient.fetchRoomInfoFromHtml === 'function') {
+    const original = tiktok.webClient.fetchRoomInfoFromHtml;
+    tiktok.webClient.fetchRoomInfoFromHtml = async (opts = {}) => {
+      // Return the minimal shape the lib expects so it never 404s on HTML
+      return { roomId: String(roomId) };
+    };
+  }
+} catch { /* non-fatal */ }
 
-		await tiktok.connect({ roomId });
-		attempt = 0;
-		send('status', { state: 'connected', user, roomId });
-		send('open', { ok: true, user, roomId });
-	  } catch (e2) {
-		// 3) Last resort: let the library try its own lookup (connect() with no args)
-		const err2 = serializeErr(e2);
-		send('status', { state: 'error', where: 'connect:second', error: err2 });
+try {
+  // 2) Call connect() with NO args. The patched retrievers short-circuit to our roomId.
+  await tiktok.connect();
+  attempt = 0;
+  send('status', { state: 'connected', user, roomId });
+  send('open', { ok: true, user, roomId });
+} catch (e1) {
+  const err1 = serializeErr(e1);
+  send('status', { state: 'error', where: 'connect:first', error: err1 });
 
-		try {
-		  await tiktok.connect();
-		  attempt = 0;
-		  send('status', { state: 'connected', user, roomId });
-		  send('open', { ok: true, user, roomId });
-		} catch (e3) {
-		  send('status', { state: 'error', where: 'connect:final', error: serializeErr(e3) });
-		  schedule('connect:reject');
-		}
-	  }
-	}
+  try {
+    // 3) Fallback: drop Host override (some edges dislike it) and force again
+    try {
+      if (tiktok.http?.defaults?.headers) {
+        delete tiktok.http.defaults.headers.Host;
+        if (tiktok.http.defaults.headers.common) delete tiktok.http.defaults.headers.common.Host;
+      }
+    } catch {}
+    try {
+      if (tiktok.webcastClient?.http?.defaults?.headers) {
+        delete tiktok.webcastClient.http.defaults.headers.Host;
+        if (tiktok.webcastClient.http.defaults.headers.common) delete tiktok.webcastClient.http.defaults.headers.common.Host;
+      }
+    } catch {}
+
+    await tiktok.connect();
+    attempt = 0;
+    send('status', { state: 'connected', user, roomId });
+    send('open', { ok: true, user, roomId });
+  } catch (e2) {
+    // 4) Last resort: try explicit parameter form used by some builds
+    const err2 = serializeErr(e2);
+    send('status', { state: 'error', where: 'connect:second', error: err2 });
+
+    try {
+      await tiktok.connect(String(roomId)); // string form for older builds
+      attempt = 0;
+      send('status', { state: 'connected', user, roomId });
+      send('open', { ok: true, user, roomId });
+    } catch (e3) {
+      send('status', { state: 'error', where: 'connect:final', error: serializeErr(e3) });
+      schedule('connect:reject');
+    }
+  }
+}
+
 }
 
   connect('init');
