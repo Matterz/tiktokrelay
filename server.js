@@ -432,7 +432,51 @@ app.get('/tiktok-sse', async (req, res) => {
     send('debug', { stage: 'attempt', user, trigger });
 
     // Keep your existing options if you had them; this is a safe default.
-    tiktok = new WebcastPushConnection(user, { enableExtendedGiftInfo: false });
+    // -- Hardened client fingerprint + headers for TikTok endpoints
+const referer = `https://www.tiktok.com/@${encodeURIComponent(user)}/live`;
+const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
+
+// Make a lightweight msToken so TikTok doesn’t instantly reject us
+function makeMsToken() {
+  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let t = '';
+  for (let i = 0; i < 107; i++) t += chars[(Math.random() * chars.length) | 0];
+  return t;
+}
+const msToken = makeMsToken();
+
+tiktok = new WebcastPushConnection(user, {
+  enableExtendedGiftInfo: false,
+
+  // Some versions of the lib respect this:
+  userAgent: ua,
+
+  // Querystring-style client params (lib appends them to TikTok URLs)
+  clientParams: {
+    app_language: 'en-US',
+    browser_language: 'en-US',
+    region: 'US',
+    referer,
+    device_platform: 'web',
+    browser_platform: 'Win32',
+    browser_name: 'Mozilla',
+    browser_version: '5.0'
+  },
+
+  // Axios request options used by the library internally
+  requestOptions: {
+    timeout: 15000,
+    headers: {
+      'User-Agent': ua,
+      'Referer': referer,
+      'Origin': 'https://www.tiktok.com',
+      'Accept-Language': 'en-US,en;q=0.9',
+      // A minimal cookie set; msToken is the important one
+      'Cookie': `msToken=${msToken}; tt-web-region=US;`
+    }
+  }
+});
+
 
     // Forward chat
     tiktok.on('chat', (msg) => {
