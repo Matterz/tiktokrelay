@@ -894,6 +894,32 @@ tiktok = new WebcastPushConnection(user, {
   }
 });
 
+// --- force the connector to use the scraped roomId and skip page re-scrape ---
+try {
+  const forceRoomId = String(roomId);
+
+  // Newer builds call _retrieveRoomId2; older call _retrieveRoomId.
+  // Return an object with both roomId and a "live" status so the lib never tries to read .status from undefined.
+  const forceRoomInfo = async () => ({ roomId: forceRoomId, status: 2 });
+
+  if (tiktok && typeof tiktok._retrieveRoomId2 === 'function') {
+    const orig = tiktok._retrieveRoomId2;
+    tiktok._retrieveRoomId2 = async (...args) => {
+      // Optional: log once so we know it would have tried to scrape
+      try { send('debug', { stage: 'patch', note: 'override _retrieveRoomId2', argsLen: args.length }); } catch {}
+      return forceRoomInfo();
+    };
+  }
+  if (tiktok && typeof tiktok._retrieveRoomId === 'function') {
+    const orig = tiktok._retrieveRoomId;
+    tiktok._retrieveRoomId = async (...args) => {
+      try { send('debug', { stage: 'patch', note: 'override _retrieveRoomId', argsLen: args.length }); } catch {}
+      return forceRoomInfo();
+    };
+  }
+} catch {}
+
+
 // After: tiktok = new WebcastPushConnection(...)
 if (tiktok && typeof tiktok._retrieveRoomId2 === 'function') {
   // Always return the roomId we already scraped
@@ -928,7 +954,7 @@ try {
 
     // --- connect ---
     try {
-      await tiktok.connect(roomId);
+      await tiktok.connect();
       attempt = 0;
       send('status', { state: 'connected', user, roomId, region: selectedRegion });
       send('open',   { ok: true, user, roomId, region: selectedRegion });
