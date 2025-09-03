@@ -919,14 +919,6 @@ try {
   }
 } catch {}
 
-
-// After: tiktok = new WebcastPushConnection(...)
-if (tiktok && typeof tiktok._retrieveRoomId2 === 'function') {
-  // Always return the roomId we already scraped
-  tiktok._retrieveRoomId2 = async () => String(roomId);
-}
-
-
 // (Optional) propagate headers into internal axios instances
 try {
   if (tiktok.http?.defaults) {
