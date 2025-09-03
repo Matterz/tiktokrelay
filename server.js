@@ -199,33 +199,42 @@ function dedupeSentences(s){
 
 // --- Platform-aware extraction ----------------------------------------------
 // YouTube (About): slice strictly between the "Description" heading
-// (optionally preceded by an HR line or written as "---- Description" or "### Description")
-// and the "Links" heading. We parse line-by-line so "channel_description" in redirect URLs
-// never triggers the boundary.
+// and the "Links" heading. If the description content is on the *same line*
+// as the "Description" token, capture that inline remainder too.
 function extractYouTubeMainByline(markdown, sourceUrl) {
   const md = unwrapJina(markdown).replace(/\r\n/g, '\n');
 
   const lines = md.split('\n');
   const isHr = (s) => /^\s*-{3,}\s*$/.test(s);
-  const isHeading = (s, word) =>
-    /^\s*(?:#{0,6}\s*)?([A-Za-z]+)\b.*$/.test(s) &&
-    new RegExp(`^\\s*(?:#{0,6}\\s*)?${word}\\b`, 'i').test(s.trim());
+  const isHeadingLine = (s, word) => new RegExp(`^\\s*(?:#{0,6}\\s*)?${word}\\b`, 'i').test(String(s || '').trim());
 
   let startLine = -1;
+  let inlineAfter = ''; // content on the SAME line as "Description"
 
   for (let i = 0; i < lines.length; i++) {
-    const cur = lines[i].trim();
+    const cur = lines[i] || '';
 
-    // Variant 1: "---- Description" on the same line
-    if (/^\s*-{3,}\s*Description\b/i.test(cur)) { startLine = i + 1; break; }
+    // Variant 1: "---- Description ..." on the same line
+    if (/^\s*-{3,}\s*Description\b/i.test(cur)) {
+      inlineAfter = cur.replace(/^\s*-{3,}\s*Description\b[:\s-]*/i, '').trim();
+      startLine = i + 1;
+      break;
+    }
 
-    // Variant 2: HR line, then "Description" heading line
-    if (isHr(cur) && i + 1 < lines.length && isHeading(lines[i + 1], 'Description')) {
-      startLine = i + 2; break;
+    // Variant 2: HR line THEN a "Description" heading line
+    if (isHr(cur) && i + 1 < lines.length && isHeadingLine(lines[i + 1], 'Description')) {
+      const next = lines[i + 1];
+      inlineAfter = String(next).replace(/^\s*(?:#{0,6}\s*)?Description\b[:\s-]*/i, '').trim();
+      startLine = i + 2;
+      break;
     }
 
     // Variant 3: Plain "Description" heading line (with optional ###)
-    if (isHeading(cur, 'Description')) { startLine = i + 1; break; }
+    if (isHeadingLine(cur, 'Description')) {
+      inlineAfter = cur.replace(/^\s*(?:#{0,6}\s*)?Description\b[:\s-]*/i, '').trim();
+      startLine = i + 1;
+      break;
+    }
   }
 
   if (startLine < 0) return '';
@@ -233,17 +242,19 @@ function extractYouTubeMainByline(markdown, sourceUrl) {
   // Find the end boundary where a clean "Links" heading appears
   let endLine = lines.length;
   for (let j = startLine; j < lines.length; j++) {
-    const cur = lines[j].trim();
-    // Accept "---- Links", "### Links", or bare "Links" heading lines
-    if (/^\s*-{3,}\s*Links\b/i.test(cur) || isHeading(cur, 'Links')) { endLine = j; break; }
+    const cur = lines[j] || '';
+    if (/^\s*-{3,}\s*Links\b/i.test(cur) || isHeadingLine(cur, 'Links')) {
+      endLine = j;
+      break;
+    }
   }
 
-  // Slice block and normalize
-  let block = lines.slice(startLine, endLine).join('\n')
-    .replace(/^\s*-{3,}\s*$/gmi, '')   // drop standalone HR lines inside the block
-    .trim();
+  // Build the block: include any inline remainder from the Description line
+  let block = (inlineAfter ? inlineAfter + '\n' : '') + lines.slice(startLine, endLine).join('\n');
 
-  // The byline is typically a single sentence at the top — collapse to one line
+  // Tidy up: remove standalone HR lines inside, collapse to one line
+  block = block.replace(/^\s*-{3,}\s*$/gmi, '').trim();
+
   let body = block
     .split(/\n+/).map(s => s.trim()).filter(Boolean)
     .join(' ');
@@ -271,7 +282,7 @@ function extractYouTubeMainByline(markdown, sourceUrl) {
   } catch {}
   body = body.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '****');
 
-  // Deduplicate/polish (handles Jina double-prints) and clamp to 100 chars
+  // Deduplicate/polish and clamp to 100 chars (preserve current API behavior)
   body = body.replace(/^(.{8,160}?)(?:\s+\1)+/i, '$1');
   body = dedupeSentences(body);
   body = dedupeHead(body);
@@ -279,6 +290,7 @@ function extractYouTubeMainByline(markdown, sourceUrl) {
 
   return clamp100(body);
 }
+
 
 // Extract Twitch "About" byline by taking the text after the followers line
 function extractTwitchAboutByline(markdown, sourceUrl) {
