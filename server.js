@@ -867,30 +867,46 @@ app.get('/tiktok-sse', async (req, res) => {
       return schedule('scrape');
     }
 
-    // --- Region (US default; switch to EU if hinted or forced) ---
-    const qpRegion = String(req.query.region || '').trim().toUpperCase();  // allow ?region=EU
-    let selectedRegion = qpRegion || (scraped.regionHint || '').toUpperCase() || 'US';
-    if (!/^(US|EU)$/.test(selectedRegion)) selectedRegion = 'US';
+   // --- Region (US default; switch to EU if hinted or forced) ---
+const qpRegion = String(req.query.region || '').trim().toUpperCase();
+let selectedRegion = qpRegion || (scraped.regionHint || '').toUpperCase() || 'US';
+if (!/^(US|EU)$/.test(selectedRegion)) selectedRegion = 'US';
 
-    let activeCookieHeader = cookieHeaderUS;
-    if (!activeCookieHeader.includes(`tt-web-region=${selectedRegion}`)) {
-      activeCookieHeader = activeCookieHeader.replace(/tt-web-region=(US|EU)/, `tt-web-region=${selectedRegion}`);
-    }
-    const activeWebcastHeaders = { ...baseHeaders, Cookie: activeCookieHeader, Host: 'webcast.tiktok.com' };
-    send('debug', { stage: 'region', selected: selectedRegion, hinted: scraped.regionHint || null });
+let activeCookieHeader = cookieHeaderUS;
+if (!activeCookieHeader.includes(`tt-web-region=${selectedRegion}`)) {
+  activeCookieHeader = activeCookieHeader.replace(/tt-web-region=(US|EU)/, `tt-web-region=${selectedRegion}`);
+}
+send('debug', { stage: 'region', selected: selectedRegion, hinted: scraped.regionHint || null });
 
-    // --- Create connector with the scraped roomId ---
-    tiktok = new WebcastPushConnection(user, {
-      roomId,
-      userAgent: ua,
-      sessionId: sessionId || undefined,
-      clientParams: { room_id: roomId },
-      requestOptions: {
-        withCredentials: true,
-        headers: activeWebcastHeaders,
-        timeout: 15000
-      }
-    });
+// IMPORTANT: Do NOT set Host here — the connector sometimes fetches www.tiktok.com pages.
+const connectorHeaders = { ...baseHeaders, Cookie: activeCookieHeader };
+
+// --- Create connector with the scraped roomId ---
+tiktok = new WebcastPushConnection(user, {
+  roomId,
+  userAgent: ua,
+  sessionId: sessionId || undefined,
+  clientParams: { room_id: roomId },
+  requestOptions: {
+    withCredentials: true,
+    headers: connectorHeaders,
+    timeout: 15000
+  }
+});
+
+// (Optional) propagate headers into internal axios instances
+try {
+  if (tiktok.http?.defaults) {
+    tiktok.http.defaults.withCredentials = true;
+    tiktok.http.defaults.headers = { ...(tiktok.http.defaults.headers || {}), ...connectorHeaders };
+    if (tiktok.http.defaults.headers.common) Object.assign(tiktok.http.defaults.headers.common, connectorHeaders);
+  }
+  if (tiktok.webcastClient?.http?.defaults) {
+    tiktok.webcastClient.http.defaults.withCredentials = true;
+    tiktok.webcastClient.http.defaults.headers = { ...(tiktok.webcastClient.http.defaults.headers || {}), ...connectorHeaders };
+    if (tiktok.webcastClient.http.defaults.headers.common) Object.assign(tiktok.webcastClient.http.defaults.headers.common, connectorHeaders);
+  }
+} catch {}
 
     // (Optional) propagate headers into internal axios instances
     try {
