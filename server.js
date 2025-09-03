@@ -212,30 +212,33 @@ function dedupeSentences(s){
 }
 
 // --- Platform-aware extraction ----------------------------------------------
-// YouTube (About): slice strictly between "Description" and "Links".
-// Supports "---- Description ...", "----\nDescription", and "### Description".
-// Captures inline text on the same line as "Description", then applies system redaction.
+/// YouTube (About): "Description" → (Links | More info | Sign in | next heading)
+// If nothing meaningful remains, return '' so the route 204s.
 function extractYouTubeMainByline(markdown, sourceUrl) {
   const md = unwrapJina(markdown).replace(/\r\n/g, '\n');
 
   const lines = md.split('\n');
   const isHr = (s) => /^\s*-{3,}\s*$/.test(s);
   const isHeadingLine = (s, word) => new RegExp(`^\\s*(?:#{0,6}\\s*)?${word}\\b`, 'i').test(String(s || '').trim());
+  const isAnyHeading = (s) => /^\s*#{2,6}\s+\S/.test(String(s || '')); // next markdown heading
+  const isStopWord = (s) => /^\s*(?:more info|sign in|log in)\s*$/i.test(String(s || '').trim());
+  const isBracketOnly = (s) => /^\s*\[[^\]]+\]\s*$/.test(String(s || ''));
 
   let startLine = -1;
   let inlineAfter = '';
 
+  // --- find start ---
   for (let i = 0; i < lines.length; i++) {
     const cur = lines[i] || '';
 
-    // Variant 1: "---- Description ..." same line
+    // "---- Description ..." same line
     if (/^\s*-{3,}\s*Description\b/i.test(cur)) {
       inlineAfter = cur.replace(/^\s*-{3,}\s*Description\b[:\s-]*/i, '').trim();
       startLine = i + 1;
       break;
     }
 
-    // Variant 2: HR line then "Description" heading
+    // HR line then "Description"
     if (isHr(cur) && i + 1 < lines.length && isHeadingLine(lines[i + 1], 'Description')) {
       const next = lines[i + 1];
       inlineAfter = String(next).replace(/^\s*(?:#{0,6}\s*)?Description\b[:\s-]*/i, '').trim();
@@ -243,32 +246,44 @@ function extractYouTubeMainByline(markdown, sourceUrl) {
       break;
     }
 
-    // Variant 3: Plain "Description" heading (optional ###)
+    // Plain "Description" (optional ###)
     if (isHeadingLine(cur, 'Description')) {
       inlineAfter = cur.replace(/^\s*(?:#{0,6}\s*)?Description\b[:\s-]*/i, '').trim();
       startLine = i + 1;
       break;
     }
   }
-
   if (startLine < 0) return '';
 
-  // Find "Links" boundary
+  // --- find end (first of Links | stop words | next heading) ---
   let endLine = lines.length;
   for (let j = startLine; j < lines.length; j++) {
     const cur = lines[j] || '';
-    if (/^\s*-{3,}\s*Links\b/i.test(cur) || isHeadingLine(cur, 'Links')) {
+    if (/^\s*-{3,}\s*Links\b/i.test(cur) || isHeadingLine(cur, 'Links') || isStopWord(cur) || isAnyHeading(cur)) {
       endLine = j;
       break;
     }
   }
 
-  // Build block (include same-line remainder), clean up
-  let block = (inlineAfter ? inlineAfter + '\n' : '') + lines.slice(startLine, endLine).join('\n');
-  block = block.replace(/^\s*-{3,}\s*$/gmi, '').trim();
+  // --- slice & clean block ---
+  let blockLines = lines.slice(startLine, endLine);
 
-  // Collapse to one line
-  let body = block.split(/\n+/).map(s => s.trim()).filter(Boolean).join(' ');
+  // Drop junk lines inside the block
+  blockLines = blockLines
+    .map(s => (s || '').trim())
+    .filter(Boolean)
+    .filter(s => !isStopWord(s))     // "More info", "Sign in", "Log in"
+    .filter(s => !isBracketOnly(s))  // "[Sign in]"
+    .filter(s => !isHr(s));          // stray horizontal rules
+
+  // Prefix any same-line remainder from "Description"
+  if (inlineAfter) blockLines.unshift(inlineAfter);
+
+  // Collapse to a single line
+  let body = blockLines.join(' ').replace(/\s+/g, ' ').trim();
+
+  // If nothing meaningful, return '' so the route 204s
+  if (!/[A-Za-z0-9]/.test(body)) return '';
 
   // Strip artifacts
   body = body
@@ -280,10 +295,10 @@ function extractYouTubeMainByline(markdown, sourceUrl) {
     .replace(/\s+/g, ' ')
     .trim();
 
-  // 🔒 System-wide redaction
+  // System-wide redaction (emails, URLs, username-derived tokens)
   body = redactBylineSystem(body, sourceUrl);
 
-  // Polish + clamp
+  // Polish + clamp (200 everywhere)
   body = body.replace(/^(.{8,160}?)(?:\s+\1)+/i, '$1');
   body = dedupeSentences(body);
   body = dedupeHead(body);
@@ -420,7 +435,6 @@ app.get('/byline', async (req, res) => {
     let usedUrl = null;
     let md = '';
     let fetchedOk = false;  // was "let ok = false"
-    let lastStatus = null;
 
     // Try candidates until one succeeds
     for (const u of candidates) {
@@ -433,7 +447,6 @@ app.get('/byline', async (req, res) => {
         headers: { 'user-agent': 'byline-proxy/1.0', 'accept-language': 'en-US,en;q=0.9' }
       });
 
-      lastStatus = r.status;
       if (!r.ok) continue;
 
       usedUrl = u;
@@ -727,7 +740,6 @@ async function connect(trigger) {
   send('debug', { stage: 'attempt', user, trigger });
 
   // --- Client fingerprint / headers ---
-// --- Client fingerprint / headers ---
 const referer = `https://www.tiktok.com/@${encodeURIComponent(user)}/live`;
 const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36';
 
@@ -913,27 +925,6 @@ function normalizeTwitchAboutUrl(raw) {
   }
 }
 
-// 12s abort helper
-function timeoutSignal(ms = 12000) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), ms);
-  return { signal: ctrl.signal, cancel: () => clearTimeout(t) };
-}
-
-// Pull out the "Markdown Content:" part from r.jina.ai (if present)
-function extractMarkdownSection(rawText) {
-  const txt = String(rawText || '');
-  const i = txt.toLowerCase().indexOf('markdown content:');
-  return i >= 0 ? txt.slice(i + 'markdown content:'.length).trim() : txt.trim();
-}
-
-// Light structure for convenience (you can ignore this client-side if you want)
-function structureMarkdown(md) {
-  const lines = md.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-  const headings = lines.filter((l) => /^#{1,6}\s+\S/.test(l));
-  return { headings, lines };
-}
-
 // GET /twitch-about?u=<twitch-channel-url>
 // Returns JSON: { sourceUrl, format: "markdown", markdown, fetchedAt }
 app.get('/twitch-about', async (req, res) => {
@@ -962,7 +953,7 @@ app.get('/twitch-about', async (req, res) => {
     }
 
     let rawText = await r.text();
-    let markdown = extractMarkdownSection(rawText);
+    let markdown = unwrapJina(rawText);
 
     // (Optional safety) cap extremely large responses to avoid memory spikes
     if (markdown.length > 400_000) markdown = markdown.slice(0, 400_000);
