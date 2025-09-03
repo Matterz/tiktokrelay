@@ -212,22 +212,50 @@ function dedupeSentences(s){
 }
 
 // --- Platform-aware extraction ----------------------------------------------
-/// YouTube (About): "Description" → (Links | More info | Sign in | next heading)
+// YouTube (About): "Description" → (Links | More info | Sign in | next heading | meta lines)
 // If nothing meaningful remains, return '' so the route 204s.
 function extractYouTubeMainByline(markdown, sourceUrl) {
   const md = unwrapJina(markdown).replace(/\r\n/g, '\n');
 
   const lines = md.split('\n');
-  const isHr = (s) => /^\s*-{3,}\s*$/.test(s);
-  const isHeadingLine = (s, word) => new RegExp(`^\\s*(?:#{0,6}\\s*)?${word}\\b`, 'i').test(String(s || '').trim());
-  const isAnyHeading = (s) => /^\s*#{2,6}\s+\S/.test(String(s || '')); // next markdown heading
-  const isStopWord = (s) => /^\s*(?:more info|sign in|log in)\s*$/i.test(String(s || '').trim());
-  const isBracketOnly = (s) => /^\s*\[[^\]]+\]\s*$/.test(String(s || ''));
+  const isHr = (s) => /^\s*-{3,}\s*$/.test(s || '');
+  const norm = (s) => String(s || '').trim();
 
+  const startsWithWord = (s, word) =>
+    new RegExp(`^\\s*(?:#{0,6}\\s*|-{3,}\\s*)?${word}\\b`, 'i').test(norm(s));
+
+  const isHeadingLine = (s, word) => startsWithWord(s, word);
+  const isAnyHeading = (s) => /^\s*#{2,6}\s+\S/.test(norm(s)); // next markdown heading
+
+  // Lines that must end the description block even if not true headings
+  const SECTION_WORDS = [
+    'Links', 'Stats', 'Details', 'Business', 'Contact', 'Email', 'Location',
+    'Country', 'Shop', 'Store', 'Join', 'Membership', 'Creator'
+  ];
+  const isSectionBoundary = (s) => SECTION_WORDS.some(w => startsWithWord(s, w));
+
+  // Lines that begin "More info"/"Sign in"/"Log in" (even with trailing text)
+  const isStopLine = (s) => /^\s*(more info|sign in|log in)\b/i.test(norm(s));
+
+  // Meta/data lines we never want in a byline
+  const isMetaLine = (s) => {
+    const t = norm(s);
+    if (!t) return false;
+    if (/^share channel\b/i.test(t)) return true;
+    if (/^joined\b/i.test(t)) return true;
+    if (/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*$/.test(t)) return false; // country names alone: handle later
+    if (/^\d[\d.,]*\s*[kKmM]?\s*(subscribers|views|videos)\b/i.test(t)) return true;
+    // Frequently-seen country words after Description when no byline exists:
+    if (/^\s*(United States|United Kingdom|Canada|Australia|India)\s*$/i.test(t)) return true;
+    return false;
+  };
+
+  const isBracketOnly = (s) => /^\s*\[[^\]]*\]\s*$/.test(String(s || ''));
+
+  // --- find start (Description) ---
   let startLine = -1;
   let inlineAfter = '';
 
-  // --- find start ---
   for (let i = 0; i < lines.length; i++) {
     const cur = lines[i] || '';
 
@@ -255,28 +283,31 @@ function extractYouTubeMainByline(markdown, sourceUrl) {
   }
   if (startLine < 0) return '';
 
-  // --- find end (first of Links | stop words | next heading) ---
+  // --- find end boundary ---
   let endLine = lines.length;
   for (let j = startLine; j < lines.length; j++) {
     const cur = lines[j] || '';
-    if (/^\s*-{3,}\s*Links\b/i.test(cur) || isHeadingLine(cur, 'Links') || isStopWord(cur) || isAnyHeading(cur)) {
+    if (
+      isSectionBoundary(cur) ||
+      isStopLine(cur) ||
+      isAnyHeading(cur) ||
+      isMetaLine(cur) ||
+      isHeadingLine(cur, 'Links') || /^\s*-{3,}\s*Links\b/i.test(cur)
+    ) {
       endLine = j;
       break;
     }
   }
 
   // --- slice & clean block ---
-  let blockLines = lines.slice(startLine, endLine);
-
-  // Drop junk lines inside the block
-  blockLines = blockLines
-    .map(s => (s || '').trim())
+  let blockLines = lines.slice(startLine, endLine)
+    .map(norm)
     .filter(Boolean)
-    .filter(s => !isStopWord(s))     // "More info", "Sign in", "Log in"
-    .filter(s => !isBracketOnly(s))  // "[Sign in]"
+    .filter(s => !isStopLine(s))     // "More info...", "Sign in...", etc.
+    .filter(s => !isMetaLine(s))     // Joined / subs / views / videos / Share channel / country
+    .filter(s => !isBracketOnly(s))  // pure bracket remnants like "[Sign in]"
     .filter(s => !isHr(s));          // stray horizontal rules
 
-  // Prefix any same-line remainder from "Description"
   if (inlineAfter) blockLines.unshift(inlineAfter);
 
   // Collapse to a single line
@@ -285,12 +316,13 @@ function extractYouTubeMainByline(markdown, sourceUrl) {
   // If nothing meaningful, return '' so the route 204s
   if (!/[A-Za-z0-9]/.test(body)) return '';
 
-  // Strip artifacts
+  // Strip artifacts (some will already be gone, this is belt & suspenders)
   body = body
     .replace(/(?:\.{3}|…)\s*more/gi, ' ')
-    .replace(/\[[^\]]+\]\([^)]+\)/g, ' ')
-    .replace(/\((?:https?:\/\/|www\.)[^)]+\)/gi, ' ')
-    .replace(/\b(?:https?:\/\/|www\.)\S+/gi, ' ')
+    .replace(/\[[^\]]+\]\([^)]+\)/g, ' ')               // [text](url)
+    .replace(/\((?:https?:\/\/|www\.)[^)]+\)/gi, ' ')   // (http...)
+    .replace(/\b(?:https?:\/\/|www\.)\S+/gi, ' ')       // bare URLs
+    .replace(/\[\s*\]/g, ' ')                           // stray "[]"
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\s+/g, ' ')
     .trim();
@@ -306,6 +338,7 @@ function extractYouTubeMainByline(markdown, sourceUrl) {
 
   return clamp200(body);
 }
+
 
 function extractTwitchAboutByline(markdown, sourceUrl) {
   const md = unwrapJina(markdown);
