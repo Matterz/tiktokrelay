@@ -198,58 +198,65 @@ function dedupeSentences(s){
 }
 
 // --- Platform-aware extraction ----------------------------------------------
-// YouTube (About tab): take text between the horizontal rule "----" + "Description"
+// YouTube (About): take everything strictly between the HR before "Description"
+// and the "Links" heading, with tolerant whitespace handling.
 function extractYouTubeMainByline(markdown, sourceUrl){
-  const txt = unwrapJina(markdown);
+  const txt0 = unwrapJina(markdown);
+  const txt  = String(txt0).replace(/\r\n/g, '\n');
 
-  // 1) Prefer the canonical About → Description block:
-  //    match a line of --- (or more), then "Description", then capture until "Links"/next section.
-  const section =
-    txt.match(/(?:^|\n)-{3,}\s*\n+Description\s*\n+([\s\S]*?)(?:\n{2,}(?:Links|Stats|Details|Business|More)\b|$)/i)
-    || txt.match(/(?:^|\n)Description\s*\n+([\s\S]*?)(?:\n{2,}(?:Links|Stats|Details|Business|More)\b|$)/i);
+  // 1) Find the "Description" heading that is preceded by a horizontal rule (--- or more)
+  //    Be tolerant of extra spaces and blank lines.
+  let startIdx = -1;
+  let m = /(?:^|\n)-{3,}[^\n]*\n+Description[^\n]*\n+/i.exec(txt);
+  if (m) {
+    startIdx = m.index + m[0].length;
+  } else {
+    // fallback: allow "Description" without the HR line (rare but harmless)
+    m = /(?:^|\n)Description[^\n]*\n+/i.exec(txt);
+    if (m) startIdx = m.index + m[0].length;
+  }
+  if (startIdx === -1) return '';
 
-  if (!section) return '';
+  // 2) Find the "Links" heading (tolerant of spaces/newlines)
+  const after = txt.slice(startIdx);
+  const endMatch = /(?:^|\n)\s*Links\s*(?:\n|$)/i.exec(after);
+  const endIdx = endMatch ? endMatch.index : after.length;
 
-  // 2) Clean the captured block
-  let body = section[1] || '';
-
-  // Remove markdown links and bare URLs first
-  body = body
-    .replace(/\[[^\]]+\]\([^)]+\)/g, ' ')             // [text](url)
-    .replace(/\((?:https?:\/\/|www\.)[^)]+\)/gi, ' ') // (http...)
-    .replace(/\b(?:https?:\/\/|www\.)\S+/gi, ' ')     // bare urls
-    .replace(/[ \t]+\n/g, '\n')
+  // 3) Slice, drop stray HR lines, then choose the first meaningful non-empty line
+  let body = after.slice(0, endIdx)
+    .replace(/^\s*-{3,}\s*$/gmi, '') // remove standalone HR lines in the block
     .trim();
 
-  // Use the first meaningful non-empty line as the byline basis
   const lines = body.split(/\n+/).map(s => s.trim()).filter(Boolean);
   body = lines.find(s => s && !/^(?:[-–•·]+|\*+)$/.test(s)) || '';
 
-  // 3) Redact channel handle/name derived from URL (keep existing behavior)
+  // 4) Clean links/URLs & whitespace
+  body = body
+    .replace(/\[[^\]]+\]\([^)]+\)/g, ' ')             // [text](url)
+    .replace(/\((?:https?:\/\/|www\.)[^)]+\)/gi, ' ') // (http...)
+    .replace(/\b(?:https?:\/\/|www\.)\S+/gi, ' ')     // bare URLs
+    .replace(/[ \t]+\n/g, '\n')
+    .trim();
+
+  // 5) Redact channel handle (from URL) and emails, same as before
   try {
-    const handleFromAt = (sourceUrl.match(/youtube\.com\/@([^/?#]+)/i) || [])[1];
+    const handleFromAt = (sourceUrl.match(/youtube\.com\/@([^\/?#]+)/i) || [])[1];
     const handleFromUC = (sourceUrl.match(/youtube\.com\/channel\/(UC[0-9A-Za-z_-]{22})/i) || [])[1];
     const h = handleFromAt || handleFromUC || '';
     if (h) {
-      // Mask exact handle and handle without leading @
       body = body
         .replace(new RegExp('\\b' + escRe(h) + '\\b', 'gi'), '****')
         .replace(new RegExp('\\b' + escRe(h.replace(/^@+/, '')) + '\\b', 'gi'), '****');
     }
   } catch {}
-
-  // Also redact emails if present
   body = body.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '****');
 
-  // 4) Dedupe/clean like before
-  body = body.replace(/^(.{8,160}?)(?:\s+\1)+/i, '$1'); // leading duplicate sentence collapse
+  // 6) De-dupe polish + clamp (preserves your current API behavior)
+  body = body.replace(/^(.{8,160}?)(?:\s+\1)+/i, '$1');
   body = dedupeSentences(body);
   body = dedupeHead(body);
-
-  // Drop masked junk at the very end (handles "********;)")
   body = stripMaskedTail(body);
 
-  // 5) Clamp to 100 chars (existing API behavior)
   return clamp100(body);
 }
 
