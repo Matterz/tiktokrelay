@@ -236,30 +236,60 @@ body = stripMaskedTail(body);
 return clamp100(body);
 }
 
-function extractTwitchAboutByline(markdown, sourceUrl){
-  const txt = unwrapJina(markdown);
-  // Split on paragraphs; score for human-ish "About me" text; avoid cookie/legal blobs
-  const BAD = /\b(cookie|cookies|consent|advertis|privacy|policy|analytics|partners|third[- ]party|marketing|targeting|gdpr|do not sell)\b/i;
-  const paras = txt.split(/\n{2,}/)
-    .map(p => p.split('\n').map(s => s.trim()).filter(Boolean).join(' '))
-    .map(stripLinksAndJunk)
-    .filter(Boolean)
-    .filter(p => !BAD.test(p));
+// Extract Twitch "About" byline by taking the text after the followers line
+// and before the first image panel ([![) or next heading.
+// Then redact emails/links and username partials (>=4 chars).
+function extractTwitchAboutByline(markdown, sourceUrl) {
+  const md = unwrapJina(markdown);
 
-  let best = '';
-  let bestScore = -1;
-  for (const p of paras) {
-    const s =
-      (p.length >= 40 && p.length <= 400 ? 60 : 0) +
-      (/[.!?]["']?$/.test(p) ? 10 : 0) +
-      (/\b(i|my|me|we|stream|streaming|live|gaming|videos?|subscribe|follow|community|thank you)\b/i.test(p) ? 25 : 0) +
-      (/\babout\b/i.test(p) ? 10 : 0);
-    if (s > bestScore) { bestScore = s; best = p; }
+  // 1) Jump to the "### About ..." section to avoid nav/header noise
+  const aboutMatch = md.match(/^\s*###\s+About\b[^\n]*$/im);
+  const startAt = aboutMatch ? md.indexOf(aboutMatch[0]) + aboutMatch[0].length : 0;
+  const tail = md.slice(startAt);
+
+  // 2) Find the followers line AFTER the About heading
+  // Accepts formats like: "1.3M followers", "9,450 followers", "123K followers"
+  const followersRe = /(^|\n)\s*\d[\d.,]*\s*[kKmM]?\s*followers\b[^\S\r\n]*\n+/i;
+  const m = followersRe.exec(tail);
+  if (!m) {
+    // Fallback: if no followers line was found in the About section, do a generic cleanup
+    // so we never return accessibility/chat boilerplate.
+    const cleaned = tail
+      .replace(/\*\*\s*·\s*\*\*/g, ' ')
+      .replace(/\[[^\]]+\]\([^)]+\)/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return clamp100(redactBylineForTwitch(cleaned, sourceUrl));
   }
+  let pos = m.index + m[0].length;
 
-  // NEW: redact emails/links/handle (incl. partials ≥4) before returning
-  const masked = redactBylineForTwitch(best, sourceUrl);
-  return clamp100(masked);
+  // 3) Define the end boundary: first [![ (panel image) OR next "###" heading OR end of doc
+  const after = tail.slice(pos);
+  const endImg = after.indexOf('[![');
+  const endHeading = after.search(/\n{2,}###\s+/);
+  let end = after.length;
+  if (endImg !== -1) end = Math.min(end, endImg);
+  if (endHeading !== -1) end = Math.min(end, endHeading);
+
+  // 4) Slice the byline block and clean it
+  let block = after.slice(0, end);
+
+  // Remove obvious decoration lines and links (e.g., "**·**", "[Team](link)")
+  block = block
+    .replace(/\*\*\s*·\s*\*\*/g, ' ')
+    .replace(/\[[^\]]+\]\([^)]+\)/g, ' ')       // strip markdown links
+    .replace(/\((?:https?:\/\/|www\.)[^)]+\)/gi, ' ') // stray bare URLs in parens
+    .replace(/\b(?:https?:\/\/|www\.)\S+/gi, ' ')     // any remaining bare URLs
+    .replace(/[ \t]+\n/g, '\n')                 // trim trailing spaces on lines
+    .trim();
+
+  // 5) Choose the first meaningful non-empty line as the byline
+  const lines = block.split(/\n+/).map(s => s.trim()).filter(Boolean);
+  let byline = lines.find(s => s && !/^(?:[-–•·]+|\*+)$/.test(s)) || '';
+
+  // 6) Redact emails/links + username partials (>=4 chars), then clamp to 100 chars
+  byline = redactBylineForTwitch(byline, sourceUrl);
+  return clamp100(byline);
 }
 
 function extractGenericByline(markdown){
