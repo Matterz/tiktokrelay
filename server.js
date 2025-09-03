@@ -198,43 +198,57 @@ function dedupeSentences(s){
 }
 
 // --- Platform-aware extraction ----------------------------------------------
-// YouTube (About): take everything strictly between the HR+Description
-// boundary and the Links heading, handling several Jina formatting variants.
+// YouTube (About): slice strictly between the "Description" heading
+// (optionally preceded by an HR line or written as "---- Description" or "### Description")
+// and the "Links" heading. We parse line-by-line so "channel_description" in redirect URLs
+// never triggers the boundary.
 function extractYouTubeMainByline(markdown, sourceUrl) {
-  const txt0 = unwrapJina(markdown);
-  const txt  = String(txt0).replace(/\r\n/g, '\n');
+  const md = unwrapJina(markdown).replace(/\r\n/g, '\n');
 
-  // --- find start (end of the "Description" heading line) ---
-  // Variant A: same line HR + Description: "---- Description"
-  const startA = /(?:^|\n)\s*-{3,}\s*Description\b[^\n]*(?:\n+|$)/i.exec(txt);
+  const lines = md.split('\n');
+  const isHr = (s) => /^\s*-{3,}\s*$/.test(s);
+  const isHeading = (s, word) =>
+    /^\s*(?:#{0,6}\s*)?([A-Za-z]+)\b.*$/.test(s) &&
+    new RegExp(`^\\s*(?:#{0,6}\\s*)?${word}\\b`, 'i').test(s.trim());
 
-  // Variant B: HR line THEN a Description heading (optionally with ###)
-  const startB = /(?:^|\n)\s*-{3,}[^\n]*\n+\s*(?:#{0,6}\s*)?Description\b[^\n]*(?:\n+|$)/i.exec(txt);
+  let startLine = -1;
 
-  // Variant C: Description heading without visible HR (fallback)
-  const startC = /(?:^|\n)\s*(?:#{0,6}\s*)?Description\b[^\n]*(?:\n+|$)/i.exec(txt);
+  for (let i = 0; i < lines.length; i++) {
+    const cur = lines[i].trim();
 
-  let startIdx = -1;
-  if (startA)       startIdx = startA.index + startA[0].length;
-  else if (startB)  startIdx = startB.index + startB[0].length;
-  else if (startC)  startIdx = startC.index + startC[0].length;
-  if (startIdx < 0) return '';
+    // Variant 1: "---- Description" on the same line
+    if (/^\s*-{3,}\s*Description\b/i.test(cur)) { startLine = i + 1; break; }
 
-  // --- find end (start of the Links heading) ---
-  const after = txt.slice(startIdx);
-  const endMatch = /(?:^|\n)\s*(?:#{0,6}\s*)?Links\b[^\n]*(?:\n|$)/i.exec(after);
-  const endIdx = endMatch ? endMatch.index : after.length;
+    // Variant 2: HR line, then "Description" heading line
+    if (isHr(cur) && i + 1 < lines.length && isHeading(lines[i + 1], 'Description')) {
+      startLine = i + 2; break;
+    }
 
-  // --- slice block, normalize, and pick the description text ---
-  let block = after.slice(0, endIdx)
-    // remove any standalone HR noise inside the block
-    .replace(/^\s*-{3,}\s*$/gmi, '')
+    // Variant 3: Plain "Description" heading line (with optional ###)
+    if (isHeading(cur, 'Description')) { startLine = i + 1; break; }
+  }
+
+  if (startLine < 0) return '';
+
+  // Find the end boundary where a clean "Links" heading appears
+  let endLine = lines.length;
+  for (let j = startLine; j < lines.length; j++) {
+    const cur = lines[j].trim();
+    // Accept "---- Links", "### Links", or bare "Links" heading lines
+    if (/^\s*-{3,}\s*Links\b/i.test(cur) || isHeading(cur, 'Links')) { endLine = j; break; }
+  }
+
+  // Slice block and normalize
+  let block = lines.slice(startLine, endLine).join('\n')
+    .replace(/^\s*-{3,}\s*$/gmi, '')   // drop standalone HR lines inside the block
     .trim();
 
-  // Collapse to one line (the byline is a single sentence for most channels)
-  let body = block.split(/\n+/).map(s => s.trim()).filter(Boolean).join(' ');
+  // The byline is typically a single sentence at the top — collapse to one line
+  let body = block
+    .split(/\n+/).map(s => s.trim()).filter(Boolean)
+    .join(' ');
 
-  // Clean links/URLs & tiny artifacts
+  // Clean links/URLs and small artifacts
   body = body
     .replace(/(?:\.{3}|…)\s*more/gi, ' ')               // "... more" / "… more"
     .replace(/\[[^\]]+\]\([^)]+\)/g, ' ')               // [text](url)
@@ -244,7 +258,7 @@ function extractYouTubeMainByline(markdown, sourceUrl) {
     .replace(/\s+/g, ' ')
     .trim();
 
-  // Redact handle from URL + emails
+  // Redact channel handle from URL + emails
   try {
     const handleFromAt = (sourceUrl.match(/youtube\.com\/@([^\/?#]+)/i) || [])[1];
     const handleFromUC = (sourceUrl.match(/youtube\.com\/channel\/(UC[0-9A-Za-z_-]{22})/i) || [])[1];
@@ -257,7 +271,7 @@ function extractYouTubeMainByline(markdown, sourceUrl) {
   } catch {}
   body = body.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '****');
 
-  // De-dupe/polish + clamp (preserve your API behavior)
+  // Deduplicate/polish (handles Jina double-prints) and clamp to 100 chars
   body = body.replace(/^(.{8,160}?)(?:\s+\1)+/i, '$1');
   body = dedupeSentences(body);
   body = dedupeHead(body);
@@ -360,7 +374,6 @@ app.get('/', (_req, res) => res.type('text/plain').send('TikTok SSE relay & Byli
  * - On success: 200 text/plain (raw text body from Jina).
  * - On any failure: 4xx/5xx JSON; client should treat as "hint unavailable".
  */
-// --- Byline proxy: YT uses MAIN page; sanitize; single attempt; no client fallback ------
 // --- Byline proxy: YT uses MAIN page; sanitize; single attempt; no client fallback ------
 app.get('/byline', async (req, res) => {
   try {
