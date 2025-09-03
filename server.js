@@ -76,36 +76,49 @@ function stripMaskedTail(s){
   return out.trim();
 }
 
-// --- Twitch redaction helpers (mask email, links, and handle/partials ≥4 chars) ---
-function twitchUsernameFromUrl(u) {
+/// --- System-level redaction (applies to ALL platforms) ---------------------
+function usernameFromAnyUrl(u) {
   try {
-    const url = new URL(u);
-    const seg = (url.pathname.split('/').filter(Boolean)[0] || '').replace(/^@/, '');
-    return seg || '';
-  } catch {
-    const m = String(u || '').match(/twitch\.tv\/([^\/?#]+)/i);
-    return m ? m[1] : '';
-  }
+    const s = String(u || '');
+    const m = s.match(/^(?:https?:)?\/\/([^\/?#]+)\/([^\/?#]+)/i);
+    if (!m) return '';
+    const host = m[1].toLowerCase();
+    let user = m[2] || '';
+
+    // Normalize key platforms
+    if (/youtube\.com$/.test(host)) {
+      const at = s.match(/youtube\.com\/@([^\/?#]+)/i);
+      if (at) user = at[1];
+      else {
+        const ch = s.match(/youtube\.com\/channel\/([^\/?#]+)/i);
+        if (ch) user = ch[1];
+      }
+    } else if (/tiktok\.com$/.test(host)) {
+      const tt = s.match(/tiktok\.com\/@([^\/?#]+)/i);
+      if (tt) user = tt[1];
+    }
+    // twitch, kick, etc. already use first path segment
+    user = String(user || '').replace(/^@/, '');
+    return user;
+  } catch { return ''; }
 }
 
-function twitchRedactionTokens(username) {
+function redactionTokensFromUsername(username) {
   const out = new Set();
   const orig = String(username || '');
   const base = orig.toLowerCase().replace(/[^a-z0-9]/g, '');
   if (!base) return [];
 
-  // Full handle
+  // Full squashed handle
   out.add(base);
 
-  // Sliding substrings length 4..8 (avoid masking 3-letter words like "the")
+  // Sliding substrings length 4..8 (keeps behavior you liked from Twitch)
   const maxLen = Math.min(8, base.length);
   for (let L = maxLen; L >= 4; L--) {
-    for (let i = 0; i + L <= base.length; i++) {
-      out.add(base.slice(i, i + L));
-    }
+    for (let i = 0; i + L <= base.length; i++) out.add(base.slice(i, i + L));
   }
 
-  // Also camelCase/number segments length ≥4 (e.g., "Dark", "Viper", "100")
+  // CamelCase/number parts length ≥4 (e.g., "Maximilian", "dood")
   const parts = (orig.match(/[A-Z]?[a-z]+|[0-9]+|[A-Z]+(?![a-z])/g) || []).map(s => s.toLowerCase());
   for (const p of parts) if (p.length >= 4) out.add(p);
 
@@ -113,7 +126,7 @@ function twitchRedactionTokens(username) {
   return Array.from(out).sort((a, b) => b.length - a.length);
 }
 
-function redactBylineForTwitch(text, sourceUrl) {
+function redactBylineSystem(text, sourceUrl) {
   let out = String(text || '');
 
   // Emails → ****
@@ -122,10 +135,10 @@ function redactBylineForTwitch(text, sourceUrl) {
   // Links/URLs → ****
   out = out.replace(/\b(?:https?:\/\/|www\.)\S+/gi, '****');
 
-  // Username & partials ≥4 → ****
-  const user = twitchUsernameFromUrl(sourceUrl);
+  // Username-derived tokens → ****  (same strategy across platforms)
+  const user = usernameFromAnyUrl(sourceUrl);
   if (user) {
-    const toks = twitchRedactionTokens(user);
+    const toks = redactionTokensFromUsername(user);
     if (toks.length) {
       const re = new RegExp(toks.map(escRe).join('|'), 'gi');
       out = out.replace(re, '****');
@@ -170,10 +183,11 @@ function dedupeHead(s){
   }
   return txt;
 }
-function clamp100(s){
+
+function clamp200(s){
   const t = String(s).trim();
-  if (t.length <= 100) return t;
-  return t.slice(0, 100).replace(/\s+\S*$/, '') + '…';
+  if (t.length <= 200) return t;
+  return t.slice(0, 200).replace(/\s+\S*$/, '') + '…';
 }
 
 // Dedupe immediate repeated sentences (e.g., "Hi! ... Hi! ...")
@@ -198,9 +212,9 @@ function dedupeSentences(s){
 }
 
 // --- Platform-aware extraction ----------------------------------------------
-// YouTube (About): slice strictly between the "Description" heading
-// and the "Links" heading. If the description content is on the *same line*
-// as the "Description" token, capture that inline remainder too.
+// YouTube (About): slice strictly between "Description" and "Links".
+// Supports "---- Description ...", "----\nDescription", and "### Description".
+// Captures inline text on the same line as "Description", then applies system redaction.
 function extractYouTubeMainByline(markdown, sourceUrl) {
   const md = unwrapJina(markdown).replace(/\r\n/g, '\n');
 
@@ -209,19 +223,19 @@ function extractYouTubeMainByline(markdown, sourceUrl) {
   const isHeadingLine = (s, word) => new RegExp(`^\\s*(?:#{0,6}\\s*)?${word}\\b`, 'i').test(String(s || '').trim());
 
   let startLine = -1;
-  let inlineAfter = ''; // content on the SAME line as "Description"
+  let inlineAfter = '';
 
   for (let i = 0; i < lines.length; i++) {
     const cur = lines[i] || '';
 
-    // Variant 1: "---- Description ..." on the same line
+    // Variant 1: "---- Description ..." same line
     if (/^\s*-{3,}\s*Description\b/i.test(cur)) {
       inlineAfter = cur.replace(/^\s*-{3,}\s*Description\b[:\s-]*/i, '').trim();
       startLine = i + 1;
       break;
     }
 
-    // Variant 2: HR line THEN a "Description" heading line
+    // Variant 2: HR line then "Description" heading
     if (isHr(cur) && i + 1 < lines.length && isHeadingLine(lines[i + 1], 'Description')) {
       const next = lines[i + 1];
       inlineAfter = String(next).replace(/^\s*(?:#{0,6}\s*)?Description\b[:\s-]*/i, '').trim();
@@ -229,7 +243,7 @@ function extractYouTubeMainByline(markdown, sourceUrl) {
       break;
     }
 
-    // Variant 3: Plain "Description" heading line (with optional ###)
+    // Variant 3: Plain "Description" heading (optional ###)
     if (isHeadingLine(cur, 'Description')) {
       inlineAfter = cur.replace(/^\s*(?:#{0,6}\s*)?Description\b[:\s-]*/i, '').trim();
       startLine = i + 1;
@@ -239,7 +253,7 @@ function extractYouTubeMainByline(markdown, sourceUrl) {
 
   if (startLine < 0) return '';
 
-  // Find the end boundary where a clean "Links" heading appears
+  // Find "Links" boundary
   let endLine = lines.length;
   for (let j = startLine; j < lines.length; j++) {
     const cur = lines[j] || '';
@@ -249,75 +263,59 @@ function extractYouTubeMainByline(markdown, sourceUrl) {
     }
   }
 
-  // Build the block: include any inline remainder from the Description line
+  // Build block (include same-line remainder), clean up
   let block = (inlineAfter ? inlineAfter + '\n' : '') + lines.slice(startLine, endLine).join('\n');
-
-  // Tidy up: remove standalone HR lines inside, collapse to one line
   block = block.replace(/^\s*-{3,}\s*$/gmi, '').trim();
 
-  let body = block
-    .split(/\n+/).map(s => s.trim()).filter(Boolean)
-    .join(' ');
+  // Collapse to one line
+  let body = block.split(/\n+/).map(s => s.trim()).filter(Boolean).join(' ');
 
-  // Clean links/URLs and small artifacts
+  // Strip artifacts
   body = body
-    .replace(/(?:\.{3}|…)\s*more/gi, ' ')               // "... more" / "… more"
-    .replace(/\[[^\]]+\]\([^)]+\)/g, ' ')               // [text](url)
-    .replace(/\((?:https?:\/\/|www\.)[^)]+\)/gi, ' ')   // (http...)
-    .replace(/\b(?:https?:\/\/|www\.)\S+/gi, ' ')       // bare URLs
+    .replace(/(?:\.{3}|…)\s*more/gi, ' ')
+    .replace(/\[[^\]]+\]\([^)]+\)/g, ' ')
+    .replace(/\((?:https?:\/\/|www\.)[^)]+\)/gi, ' ')
+    .replace(/\b(?:https?:\/\/|www\.)\S+/gi, ' ')
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\s+/g, ' ')
     .trim();
 
-  // Redact channel handle from URL + emails
-  try {
-    const handleFromAt = (sourceUrl.match(/youtube\.com\/@([^\/?#]+)/i) || [])[1];
-    const handleFromUC = (sourceUrl.match(/youtube\.com\/channel\/(UC[0-9A-Za-z_-]{22})/i) || [])[1];
-    const h = handleFromAt || handleFromUC || '';
-    if (h) {
-      body = body
-        .replace(new RegExp('\\b' + escRe(h) + '\\b', 'gi'), '****')
-        .replace(new RegExp('\\b' + escRe(h.replace(/^@+/, '')) + '\\b', 'gi'), '****');
-    }
-  } catch {}
-  body = body.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '****');
+  // 🔒 System-wide redaction
+  body = redactBylineSystem(body, sourceUrl);
 
-  // Deduplicate/polish and clamp to 100 chars (preserve current API behavior)
+  // Polish + clamp
   body = body.replace(/^(.{8,160}?)(?:\s+\1)+/i, '$1');
   body = dedupeSentences(body);
   body = dedupeHead(body);
   body = stripMaskedTail(body);
 
-  return clamp100(body);
+  return clamp200(body);
 }
 
-
-// Extract Twitch "About" byline by taking the text after the followers line
 function extractTwitchAboutByline(markdown, sourceUrl) {
   const md = unwrapJina(markdown);
 
-  // 1) Jump to the "### About ..." section to avoid nav/header noise
+  // 1) Jump to the "### About" section to avoid nav/header noise
   const aboutMatch = md.match(/^\s*###\s+About\b[^\n]*$/im);
   const startAt = aboutMatch ? md.indexOf(aboutMatch[0]) + aboutMatch[0].length : 0;
   const tail = md.slice(startAt);
 
   // 2) Find the followers line AFTER the About heading
-  // Accepts formats like: "1.3M followers", "9,450 followers", "123K followers"
   const followersRe = /(^|\n)\s*\d[\d.,]*\s*[kKmM]?\s*followers\b[^\S\r\n]*\n+/i;
   const m = followersRe.exec(tail);
   if (!m) {
-    // Fallback: if no followers line was found in the About section, do a generic cleanup
-    // so we never return accessibility/chat boilerplate.
+    // Fallback: generic cleanup
     const cleaned = tail
       .replace(/\*\*\s*·\s*\*\*/g, ' ')
       .replace(/\[[^\]]+\]\([^)]+\)/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
-    return clamp100(redactBylineForTwitch(cleaned, sourceUrl));
+    const red = redactBylineSystem(cleaned, sourceUrl);
+    return clamp200(red);
   }
   let pos = m.index + m[0].length;
 
-  // 3) Define the end boundary: first [![ (panel image) OR next "###" heading OR end of doc
+  // 3) End boundary: first [![ (panel image) OR next "###" heading OR end
   const after = tail.slice(pos);
   const endImg = after.indexOf('[![');
   const endHeading = after.search(/\n{2,}###\s+/);
@@ -325,25 +323,25 @@ function extractTwitchAboutByline(markdown, sourceUrl) {
   if (endImg !== -1) end = Math.min(end, endImg);
   if (endHeading !== -1) end = Math.min(end, endHeading);
 
-  // 4) Slice the byline block and clean it
-  let block = after.slice(0, end);
-
-  // Remove obvious decoration lines and links (e.g., "**·**", "[Team](link)")
-  block = block
+  // 4) Slice block and clean it
+  let block = after.slice(0, end)
     .replace(/\*\*\s*·\s*\*\*/g, ' ')
-    .replace(/\[[^\]]+\]\([^)]+\)/g, ' ')       // strip markdown links
-    .replace(/\((?:https?:\/\/|www\.)[^)]+\)/gi, ' ') // stray bare URLs in parens
-    .replace(/\b(?:https?:\/\/|www\.)\S+/gi, ' ')     // any remaining bare URLs
-    .replace(/[ \t]+\n/g, '\n')                 // trim trailing spaces on lines
+    .replace(/\[[^\]]+\]\([^)]+\)/g, ' ')
+    .replace(/\((?:https?:\/\/|www\.)[^)]+\)/gi, ' ')
+    .replace(/\b(?:https?:\/\/|www\.)\S+/gi, ' ')
+    .replace(/[ \t]+\n/g, '\n')
     .trim();
 
-  // 5) Choose the first meaningful non-empty line as the byline
+  // 5) First meaningful non-empty line
   const lines = block.split(/\n+/).map(s => s.trim()).filter(Boolean);
   let byline = lines.find(s => s && !/^(?:[-–•·]+|\*+)$/.test(s)) || '';
 
-  // 6) Redact emails/links + username partials (>=4 chars), then clamp to 100 chars
-  byline = redactBylineForTwitch(byline, sourceUrl);
-  return clamp100(byline);
+  // 🔒 System-wide redaction + polish + clamp
+  byline = redactBylineSystem(byline, sourceUrl);
+  byline = dedupeSentences(byline);
+  byline = dedupeHead(byline);
+  byline = stripMaskedTail(byline);
+  return clamp200(byline);
 }
 
 function extractGenericByline(markdown){
@@ -366,7 +364,12 @@ function extractGenericByline(markdown){
       (/\b(i|my|we|channel|subscribe|video|videos|stream|streaming|gaming|variety)\b/i.test(p) ? 20 : 0);
     if (s > score) { score = s; best = p; }
   }
-  return clamp100(best);
+
+  best = redactBylineSystem(best, '');      // apply system-wide redaction
+  best = dedupeSentences(best);
+  best = dedupeHead(best);
+  best = stripMaskedTail(best);
+  return clamp200(best);
 }
 
 function extractBylineFor(url, markdown){
