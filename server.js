@@ -894,6 +894,13 @@ tiktok = new WebcastPushConnection(user, {
   }
 });
 
+// After: tiktok = new WebcastPushConnection(...)
+if (tiktok && typeof tiktok._retrieveRoomId2 === 'function') {
+  // Always return the roomId we already scraped
+  tiktok._retrieveRoomId2 = async () => String(roomId);
+}
+
+
 // (Optional) propagate headers into internal axios instances
 try {
   if (tiktok.http?.defaults) {
@@ -908,20 +915,6 @@ try {
   }
 } catch {}
 
-    // (Optional) propagate headers into internal axios instances
-    try {
-      if (tiktok.http?.defaults) {
-        tiktok.http.defaults.withCredentials = true;
-        tiktok.http.defaults.headers = { ...(tiktok.http.defaults.headers || {}), ...activeWebcastHeaders };
-        if (tiktok.http.defaults.headers.common) Object.assign(tiktok.http.defaults.headers.common, activeWebcastHeaders);
-      }
-      if (tiktok.webcastClient?.http?.defaults) {
-        tiktok.webcastClient.http.defaults.withCredentials = true;
-        tiktok.webcastClient.http.defaults.headers = { ...(tiktok.webcastClient.http.defaults.headers || {}), ...activeWebcastHeaders };
-        if (tiktok.webcastClient.http.defaults.headers.common) Object.assign(tiktok.webcastClient.http.defaults.headers.common, activeWebcastHeaders);
-      }
-    } catch {}
-
     // --- events ---
     tiktok.on('chat', (msg) => {
       send('chat', { comment: String(msg.comment || ''), uniqueId: msg.uniqueId || '', nickname: msg.nickname || '' });
@@ -935,7 +928,7 @@ try {
 
     // --- connect ---
     try {
-      await tiktok.connect(); // no arg; roomId provided in constructor
+      await tiktok.connect(roomId);
       attempt = 0;
       send('status', { state: 'connected', user, roomId, region: selectedRegion });
       send('open',   { ok: true, user, roomId, region: selectedRegion });
