@@ -623,7 +623,7 @@ async function getTikTokCookieHeader(user, baseHeaders) {
 
 // Robustly scrape a TikTok @user page to find the current roomId.
 // If opts.validate === false, we trust the page and return the first roomId found
-// without calling the webcast API. Also returns streamId for diagnostics.
+// without calling the webcast API. Also returns streamId + pageLive + regionHint.
 async function scrapeRoomIdFromWebProfile(user, headers, opts = { validate: true }) {
   const urlLive = `https://www.tiktok.com/@${encodeURIComponent(user)}/live`;
   const urlHome = `https://www.tiktok.com/@${encodeURIComponent(user)}`;
@@ -637,74 +637,83 @@ async function scrapeRoomIdFromWebProfile(user, headers, opts = { validate: true
   const candidates = [];
   let seenStreamId = null;
   let pageSaysLive = null;
+  let regionHint = null;
 
   for (const url of [urlLive, urlHome]) {
     try {
       const { ok, text } = await grab(url);
       if (!ok || !text) continue;
 
+      // Heuristic for region: look for CDN hosts in the HTML quickly
+      if (!regionHint) {
+        if (/\btiktokcdn-eu\.com\b/i.test(text)) regionHint = 'EU';
+        else if (/\btiktokcdn-us\.com\b/i.test(text) || /-us\.tiktokcdn/i.test(text)) regionHint = 'US';
+      }
+
       const sigi = text.match(/<script[^>]+id="SIGI_STATE"[^>]*>([\s\S]*?)<\/script>/);
       if (sigi) {
         try {
           const json = JSON.parse(sigi[1]);
 
-          // 1) Primary explicit path seen on your page
+          // RoomId sources
           const userRoomId = json?.LiveRoom?.liveRoomUserInfo?.user?.roomId;
           if (userRoomId) candidates.push(String(userRoomId));
-
-          // 2) Other common places we’ve seen room ids
           if (json?.LiveRoom?.liveRoomId) candidates.push(String(json.LiveRoom.liveRoomId));
           if (json?.LiveRoom?.roomId) candidates.push(String(json.LiveRoom.roomId));
           if (json?.RoomStore?.roomId) candidates.push(String(json.RoomStore.roomId));
 
-          // 3) Page-level live flag hints
-          const status = json?.LiveRoom?.liveRoom?.status;
+          // Is page showing "live"?
+          const roomStatus     = json?.LiveRoom?.liveRoom?.status;
+          const pageUserStatus = json?.LiveRoom?.liveRoomUserInfo?.user?.status;
           const isLive =
-            status === 1 || status === 2 ||
+            roomStatus === 1 || roomStatus === 2 ||
+            pageUserStatus === 1 || pageUserStatus === 2 ||
             json?.LiveRoom?.isLive === true ||
             json?.UserLiveState?.isLive === true || null;
           pageSaysLive = Boolean(isLive);
 
-          // 4) Capture streamId for logging/diagnostics (do NOT use for webcast)
+          // Stream id (diagnostics only)
           if (json?.LiveRoom?.streamId) seenStreamId = String(json.LiveRoom.streamId);
 
-          // 5) Regex fallback over JSON string
+          // Fallback roomId regex
           const j = JSON.stringify(json);
           let m = j.match(/"roomId":"(\d+)"/) || j.match(/"room_id":"(\d+)"/);
           if (m) candidates.push(m[1]);
+
+          // Region hint inside JSON (HLS/FLV urls)
+          if (!regionHint) {
+            if (/\btiktokcdn-eu\.com\b/i.test(j)) regionHint = 'EU';
+            else if (/\btiktokcdn-us\.com\b/i.test(j) || /-us\.tiktokcdn/i.test(j)) regionHint = 'US';
+          }
         } catch { /* keep scanning */ }
       }
 
-      // 6) Last-ditch: regex directly over HTML
+      // Last-ditch: regex over HTML
       let mHtml = text.match(/"roomId":"(\d+)"/) || text.match(/"room_id":"(\d+)"/);
       if (mHtml) candidates.push(mHtml[1]);
 
-      // If we found any candidates on this URL, we can stop scanning further URLs
-      if (candidates.length) break;
+      if (candidates.length) break; // stop after first page that yields candidates
     } catch { /* try next URL */ }
   }
 
-  // De-dup in discovery order
   const uniq = Array.from(new Set(candidates));
-  if (!uniq.length) return { roomId: null, streamId: seenStreamId, isLive: false, from: null };
+  if (!uniq.length) return { roomId: null, streamId: seenStreamId, pageLive: false, isLive: false, regionHint, from: null };
 
-  // If we’re trusting the page, return the first candidate immediately
   if (opts.validate === false) {
-    return { roomId: uniq[0], streamId: seenStreamId, isLive: pageSaysLive ?? true, from: 'page-trust' };
+    return { roomId: uniq[0], streamId: seenStreamId, pageLive: pageSaysLive ?? true, isLive: pageSaysLive ?? true, regionHint, from: 'page-trust' };
   }
 
-  // Otherwise validate candidates against webcast
+  // Validate candidates via webcast
   for (const rid of uniq) {
     try {
       const check = await getWebcastRoomStatus(rid, { ...headers, Host: 'webcast.tiktok.com' });
       if (check && check.live) {
-        return { roomId: rid, streamId: seenStreamId, isLive: true, from: 'validated' };
+        return { roomId: rid, streamId: seenStreamId, pageLive: pageSaysLive, isLive: true, regionHint, from: 'validated' };
       }
     } catch { /* try next candidate */ }
   }
 
-  // Couldn’t validate; report the best we have
-  return { roomId: uniq[0], streamId: seenStreamId, isLive: false, from: 'unvalidated' };
+  return { roomId: uniq[0], streamId: seenStreamId, pageLive: pageSaysLive, isLive: false, regionHint, from: 'unvalidated' };
 }
 
 // Check if a roomId is actually live via the webcast API
@@ -792,116 +801,165 @@ async function connect(trigger) {
   send('debug', { stage: 'attempt', user, trigger });
 
   // --- Client fingerprint / headers ---
-const referer = `https://www.tiktok.com/@${encodeURIComponent(user)}/live`;
-const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36';
+  const referer = `https://www.tiktok.com/@${encodeURIComponent(user)}/live`;
+  const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36';
 
-function makeMsToken() {
-  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let t = '';
-  for (let i = 0; i < 107; i++) t += chars[(Math.random() * chars.length) | 0];
-  return t;
+  function makeMsToken() {
+    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    let t = '';
+    for (let i = 0; i < 107; i++) t += chars[(Math.random() * chars.length) | 0];
+    return t;
+  }
+  const msToken = makeMsToken();
+  const sessionId = (process.env.TIKTOK_SESSIONID || '').trim();
+
+  const baseHeaders = {
+    'User-Agent': ua,
+    'Referer': referer,
+    'Origin': 'https://www.tiktok.com',
+    'sec-ch-ua': '"Chromium";v="126", "Not.A/Brand";v="24", "Google Chrome";v="126"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'Sec-Fetch-Site': 'same-site',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Dest': 'empty',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9'
+  };
+
+  // Acquire TikTok cookies (ttwid, odin_tt, etc.)
+  let extraCookie = '';
+  try { extraCookie = await getTikTokCookieHeader(user, baseHeaders); } catch {}
+
+  // Build initial cookie as US; we may switch to EU after scraping if needed
+  const cookieParts = ['msToken=' + msToken, 'tt-web-region=US'];
+  if (extraCookie) cookieParts.push(extraCookie);
+  if (sessionId) {
+    cookieParts.push('sessionid=' + sessionId);
+    cookieParts.push('sessionid_ss=' + sessionId);
+  }
+  const cookieHeaderUS = cookieParts.join('; ');
+
+  // These headers are used for the initial scrape
+  const commonHeaders = { ...baseHeaders, Cookie: cookieHeaderUS };
+
+  // --- Pre-scrape roomId from public web page ---
+  const trust = String(req.query.trust || '') === '1';
+  const force = String(req.query.force || '') === '1';
+  let roomId = null;
+  let scraped;
+
+  try {
+    scraped = await scrapeRoomIdFromWebProfile(user, commonHeaders, { validate: !trust });
+    send('debug', { stage: 'room-scrape', user, scraped });
+
+    const shouldConnect =
+      scraped && scraped.roomId &&
+      (trust || force || scraped.isLive === true || scraped.pageLive === true);
+
+    if (!shouldConnect) {
+      send('room', { user, isLive: false });
+      send('status', { state: 'offline', user, reason: 'scrape-validate-failed', trust, pageLive: scraped?.pageLive ?? null });
+      return schedule('no-live');
+    }
+
+    roomId = scraped.roomId;
+    send('room', { user, roomId, isLive: true, trust, pageLive: scraped.pageLive === true });
+  } catch (e) {
+    send('status', { state: 'error', where: 'scrape', error: serializeErr(e) });
+    return schedule('scrape');
+  }
+
+  // --- Region selection (US default; EU if hinted or forced) ---
+  const qpRegion = String(req.query.region || '').trim().toUpperCase();       // allow ?region=EU
+  let selectedRegion = qpRegion || (scraped.regionHint || '').toUpperCase() || 'US';
+  if (!/^(US|EU)$/.test(selectedRegion)) selectedRegion = 'US';
+
+  let activeCookieHeader = cookieHeaderUS;
+  if (!activeCookieHeader.includes(`tt-web-region=${selectedRegion}`)) {
+    activeCookieHeader = activeCookieHeader.replace(/tt-web-region=(US|EU)/, `tt-web-region=${selectedRegion}`);
+  }
+  const activeWebcastHeaders = { ...baseHeaders, Cookie: activeCookieHeader, Host: 'webcast.tiktok.com' };
+  send('debug', { stage: 'region', selected: selectedRegion, hinted: scraped.regionHint || null });
+
+  /* --- Create the connector with the scraped roomId --- */
+  tiktok = new WebcastPushConnection(user, {
+    roomId,
+    userAgent: ua,
+    sessionId: sessionId || undefined,
+    clientParams: { room_id: roomId },
+    requestOptions: {
+      withCredentials: true,
+      headers: activeWebcastHeaders,
+      timeout: 15000
+    }
+  });
+
+  /* (Optional) still force headers into any internal axios instances if present */
+  try {
+    if (tiktok.http?.defaults) {
+      tiktok.http.defaults.withCredentials = true;
+      tiktok.http.defaults.headers = { ...(tiktok.http.defaults.headers || {}), ...activeWebcastHeaders };
+      if (tiktok.http.defaults.headers.common) Object.assign(tiktok.http.defaults.headers.common, activeWebcastHeaders);
+    }
+    if (tiktok.webcastClient?.http?.defaults) {
+      tiktok.webcastClient.http.defaults.withCredentials = true;
+      tiktok.webcastClient.http.defaults.headers = { ...(tiktok.webcastClient.http.defaults.headers || {}), ...activeWebcastHeaders };
+      if (tiktok.webcastClient.http.defaults.headers.common) Object.assign(tiktok.webcastClient.http.defaults.headers.common, activeWebcastHeaders);
+    }
+  } catch {}
+
+  /* --- events --- */
+  tiktok.on('chat', (msg) => {
+    send('chat', { comment: String(msg.comment || ''), uniqueId: msg.uniqueId || '', nickname: msg.nickname || '' });
+  });
+  const onDisc = () => { send('status', { state: 'disconnected' }); schedule('disconnected'); };
+  const onErr  = (e) => { send('status', { state: 'error', error: serializeErr(e) }); schedule('error'); };
+  const onEnd  = () => { send('status', { state: 'ended' }); schedule('streamEnd'); };
+  tiktok.on('disconnected', onDisc);
+  tiktok.on('error', onErr);
+  tiktok.on('streamEnd', onEnd);
+
+  /* --- connect --- */
+  try {
+    await tiktok.connect();     // no arg; roomId provided in constructor
+    attempt = 0;
+    send('status', { state: 'connected', user, roomId, region: selectedRegion });
+    send('open',   { ok: true, user, roomId, region: selectedRegion });
+  } catch (e) {
+    send('status', { state: 'error', where: 'connect', error: serializeErr(e) });
+    schedule('connect:reject');
+  }
 }
-const msToken = makeMsToken();
-const sessionId = (process.env.TIKTOK_SESSIONID || '').trim();
-
-
-// Start with browser-like headers (for cookie fetch + connector)
-const baseHeaders = {
-  'User-Agent': ua,
-  'Referer': referer,
-  'Origin': 'https://www.tiktok.com',
-
-  // IMPORTANT: modern hint headers to avoid 4xx on webcast endpoints
-  'sec-ch-ua': '"Chromium";v="126", "Not.A/Brand";v="24", "Google Chrome";v="126"',
-  'sec-ch-ua-mobile': '?0',
-  'sec-ch-ua-platform': '"Windows"',
-
-  'Sec-Fetch-Site': 'same-site',
-  'Sec-Fetch-Mode': 'cors',
-  'Sec-Fetch-Dest': 'empty',
-  'Accept-Encoding': 'gzip, deflate, br',
-
-  // Typical accept set used by the site
-  'Accept': 'application/json, text/plain, */*',
-  'Accept-Language': 'en-US,en;q=0.9'
-};
-
-// Acquire TikTok cookies (ttwid, odin_tt, etc.)
-let extraCookie = '';
-try { extraCookie = await getTikTokCookieHeader(user, baseHeaders); } catch {}
-
-// Final Cookie header we’ll use everywhere
-const cookieParts = ['msToken=' + msToken, 'tt-web-region=US'];
-if (extraCookie) cookieParts.push(extraCookie);
-if (sessionId) {
-  cookieParts.push('sessionid=' + sessionId);     // primary login cookie
-  cookieParts.push('sessionid_ss=' + sessionId);  // secondary key some edges check
-}
-const cookieHeader = cookieParts.join('; ');
-
-// Single headers object for both scraping and connector requests
-const commonHeaders = {
-  ...baseHeaders,
-  'Cookie': cookieHeader
-};
-
-// Webcast endpoints are on a different host; some edges check Host explicitly
-const webcastHeaders = {
-  ...commonHeaders,
-  Host: 'webcast.tiktok.com'
-};
 
 // --- Pre-scrape roomId from public web page ---
 // Add ?trust=1 to bypass webcast validation if the page shows a live room.
-// e.g. /tiktok-sse?user=keyaogames&trust=1
+// Add ?force=1 to always try connecting when a roomId is present.
 const trust = String(req.query.trust || '') === '1';
+const force = String(req.query.force || '') === '1';
 let roomId = null;
 
 try {
   const scraped = await scrapeRoomIdFromWebProfile(user, commonHeaders, { validate: !trust });
   send('debug', { stage: 'room-scrape', user, scraped });
-  if (!scraped || !scraped.roomId || (scraped.isLive === false && !trust)) {
+
+  const shouldConnect =
+    scraped && scraped.roomId &&
+    (trust || force || scraped.isLive === true || scraped.pageLive === true);
+
+  if (!shouldConnect) {
     send('room', { user, isLive: false });
-    send('status', { state: 'offline', user, reason: 'scrape-validate-failed', trust });
+    send('status', { state: 'offline', user, reason: 'scrape-validate-failed', trust, pageLive: scraped?.pageLive ?? null });
     return schedule('no-live');
   }
 
   roomId = scraped.roomId;
-  send('room', { user, roomId, isLive: true, trust });
+  send('room', { user, roomId, isLive: true, trust, pageLive: scraped.pageLive === true });
 } catch (e) {
   send('status', { state: 'error', where: 'scrape', error: serializeErr(e) });
   return schedule('scrape');
 }
-
-tiktok = new WebcastPushConnection(user, {
-  enableExtendedGiftInfo: false,
-
-  // Some versions read this:
-  roomId,
-	userAgent: ua,
-  sessionId: sessionId || undefined, 
-
-  // Query params appended to the internal HTTP calls
-  clientParams: {
-    app_language: 'en-US',
-    browser_language: 'en-US',
-    region: 'US',
-    referer,
-    device_platform: 'web',
-    browser_platform: 'Win32',
-    browser_name: 'Mozilla',
-    browser_version: '5.0',
-    msToken,
-	room_id: roomId
-  },
-
-  // Axios request options used internally
-  requestOptions: {
-    timeout: 15000,
-    withCredentials: true,
-    headers: webcastHeaders   // <- use the webcast host override here
-  }
-});
 
 
 // Force our headers/cookies into the connector’s internal axios instances
@@ -932,31 +990,63 @@ try {
   }
 } catch {}
 
-  // --- events (unchanged)
-  tiktok.on('chat', (msg) => {
-    send('chat', {
-      comment: String(msg.comment || ''),
-      uniqueId: msg.uniqueId || '',
-      nickname: msg.nickname || ''
-    });
-  });
-  const onDisc = () => { send('status', { state: 'disconnected' }); schedule('disconnected'); };
-  const onErr  = (e) => { send('status', { state: 'error', error: serializeErr(e) }); schedule('error'); };
-  const onEnd  = () => { send('status', { state: 'ended' }); schedule('streamEnd'); };
-  tiktok.on('disconnected', onDisc);
-  tiktok.on('error', onErr);
-  tiktok.on('streamEnd', onEnd);
+/* --- Create the connector with the scraped roomId --- */
+tiktok = new WebcastPushConnection(user, {
+  roomId,                 // ⬅️ this tells the lib to connect to this exact room
+  userAgent: ua,          // pass-through UA
+  sessionId: sessionId || undefined,  // optional: your login cookie if set
 
-// Connect directly with the known room id (fork honors this and skips HTML scraping)
+  // belt & suspenders: also surface the room id in client params used by some edges
+  clientParams: { room_id: roomId },
+
+  // Make sure every internal request uses our headers/cookies
+  requestOptions: {
+    withCredentials: true,
+    headers: webcastHeaders,
+    timeout: 15000
+  }
+});
+
+/* (Optional) still force headers into any internal axios instances if present */
 try {
-  await tiktok.connect(roomId);     // <- no internal room-id fetch
+  if (tiktok.http?.defaults) {
+    tiktok.http.defaults.withCredentials = true;
+    tiktok.http.defaults.headers = { ...(tiktok.http.defaults.headers || {}), ...webcastHeaders };
+    if (tiktok.http.defaults.headers.common) Object.assign(tiktok.http.defaults.headers.common, webcastHeaders);
+  }
+  if (tiktok.webcastClient?.http?.defaults) {
+    tiktok.webcastClient.http.defaults.withCredentials = true;
+    tiktok.webcastClient.http.defaults.headers = { ...(tiktok.webcastClient.http.defaults.headers || {}), ...webcastHeaders };
+    if (tiktok.webcastClient.http.defaults.headers.common) Object.assign(tiktok.webcastClient.http.defaults.headers.common, webcastHeaders);
+  }
+} catch {}
+
+/* --- events --- */
+tiktok.on('chat', (msg) => {
+  send('chat', {
+    comment: String(msg.comment || ''),
+    uniqueId: msg.uniqueId || '',
+    nickname: msg.nickname || ''
+  });
+});
+const onDisc = () => { send('status', { state: 'disconnected' }); schedule('disconnected'); };
+const onErr  = (e) => { send('status', { state: 'error', error: serializeErr(e) }); schedule('error'); };
+const onEnd  = () => { send('status', { state: 'ended' }); schedule('streamEnd'); };
+tiktok.on('disconnected', onDisc);
+tiktok.on('error', onErr);
+tiktok.on('streamEnd', onEnd);
+
+/* --- connect --- */
+try {
+  await tiktok.connect();          // ⬅️ no arg; roomId was provided in constructor
   attempt = 0;
   send('status', { state: 'connected', user, roomId });
-  send('open', { ok: true, user, roomId });
+  send('open',   { ok: true, user, roomId });
 } catch (e) {
   send('status', { state: 'error', where: 'connect', error: serializeErr(e) });
   schedule('connect:reject');
 }
+
 }
   connect('init');
 });
