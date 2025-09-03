@@ -198,47 +198,62 @@ function dedupeSentences(s){
 }
 
 // --- Platform-aware extraction ----------------------------------------------
+// YouTube (About tab): take text between the horizontal rule "----" + "Description"
 function extractYouTubeMainByline(markdown, sourceUrl){
   const txt = unwrapJina(markdown);
 
-  // Grab the text immediately AFTER "… subscribers • … videos"
-  const m = txt.match(/\bsubscribers\b[^\n]{0,200}?\bvideos\b\s*([^\n]{8,600})/i);
-  if (!m || !m[1]) return '';
+  // 1) Prefer the canonical About → Description block:
+  //    match a line of --- (or more), then "Description", then capture until "Links"/next section.
+  const section =
+    txt.match(/(?:^|\n)-{3,}\s*\n+Description\s*\n+([\s\S]*?)(?:\n{2,}(?:Links|Stats|Details|Business|More)\b|$)/i)
+    || txt.match(/(?:^|\n)Description\s*\n+([\s\S]*?)(?:\n{2,}(?:Links|Stats|Details|Business|More)\b|$)/i);
 
-  // Clean junk/links first
-  let body = stripLinksAndJunk(m[1]);
+  if (!section) return '';
 
-  // Redact channel handle/name derived from URL
+  // 2) Clean the captured block
+  let body = section[1] || '';
+
+  // Remove markdown links and bare URLs first
+  body = body
+    .replace(/\[[^\]]+\]\([^)]+\)/g, ' ')             // [text](url)
+    .replace(/\((?:https?:\/\/|www\.)[^)]+\)/gi, ' ') // (http...)
+    .replace(/\b(?:https?:\/\/|www\.)\S+/gi, ' ')     // bare urls
+    .replace(/[ \t]+\n/g, '\n')
+    .trim();
+
+  // Use the first meaningful non-empty line as the byline basis
+  const lines = body.split(/\n+/).map(s => s.trim()).filter(Boolean);
+  body = lines.find(s => s && !/^(?:[-–•·]+|\*+)$/.test(s)) || '';
+
+  // 3) Redact channel handle/name derived from URL (keep existing behavior)
   try {
     const handleFromAt = (sourceUrl.match(/youtube\.com\/@([^/?#]+)/i) || [])[1];
     const handleFromUC = (sourceUrl.match(/youtube\.com\/channel\/(UC[0-9A-Za-z_-]{22})/i) || [])[1];
     const h = handleFromAt || handleFromUC || '';
     if (h) {
+      // Mask exact handle and handle without leading @
       body = body
         .replace(new RegExp('\\b' + escRe(h) + '\\b', 'gi'), '****')
         .replace(new RegExp('\\b' + escRe(h.replace(/^@+/, '')) + '\\b', 'gi'), '****');
     }
   } catch {}
 
-  // Some scrapes echo the first sentence twice; collapse that.
-  //  - Start-of-string duplicate collapse
-  body = body.replace(/^(.{8,160}?)(?:\s+\1)+/i, '$1');
-  //  - Sentence-level dedupe
+  // Also redact emails if present
+  body = body.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '****');
+
+  // 4) Dedupe/clean like before
+  body = body.replace(/^(.{8,160}?)(?:\s+\1)+/i, '$1'); // leading duplicate sentence collapse
   body = dedupeSentences(body);
+  body = dedupeHead(body);
 
-// Final tidy (also collapses any lingering “more” we missed)
-body = dedupeHead(body);
+  // Drop masked junk at the very end (handles "********;)")
+  body = stripMaskedTail(body);
 
-// Drop masked junk if it appears at the very end (e.g., "********;)")
-body = stripMaskedTail(body);
-
-// Show a concise hint (100 chars)
-return clamp100(body);
+  // 5) Clamp to 100 chars (existing API behavior)
+  return clamp100(body);
 }
 
 // Extract Twitch "About" byline by taking the text after the followers line
-// and before the first image panel ([![) or next heading.
-// Then redact emails/links and username partials (>=4 chars).
 function extractTwitchAboutByline(markdown, sourceUrl) {
   const md = unwrapJina(markdown);
 
@@ -344,10 +359,13 @@ app.get('/byline', async (req, res) => {
     const ok = /^(https?:)?\/\/(?:www\.)?(youtube\.com|twitch\.tv|kick\.com)\b/i.test(rawUrl);
     if (!ok) return res.status(400).type('text/plain').send('Unsupported host');
 
-    // YouTube: force main channel page (strip trailing /about)
-    if (/youtube\.com/i.test(rawUrl)) {
-      rawUrl = rawUrl.replace(/\/about(?:$|[/?#].*)/i, '');
-    }
+    // YouTube: force the About tab
+	if (/youtube\.com/i.test(rawUrl)) {
+	  // strip query/hash, trailing slash
+	  rawUrl = rawUrl.replace(/[?#].*$/, '').replace(/\/$/, '');
+	  // ensure /about is present
+	  if (!/\/about(?:$|[/?#])/.test(rawUrl)) rawUrl = rawUrl + '/about';
+	}
 
     // Fetch via r.jina.ai mirror
     const target = rawUrl.replace(/^https?:\/\//i, '');
