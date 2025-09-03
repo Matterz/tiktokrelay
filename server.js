@@ -898,26 +898,37 @@ tiktok = new WebcastPushConnection(user, {
 try {
   const forceRoomId = String(roomId);
 
-  // Newer builds call _retrieveRoomId2; older call _retrieveRoomId.
-  // Return an object with both roomId and a "live" status so the lib never tries to read .status from undefined.
+  // Always return an object with { roomId, status } so the lib never reads .status from undefined
   const forceRoomInfo = async () => ({ roomId: forceRoomId, status: 2 });
 
-  if (tiktok && typeof tiktok._retrieveRoomId2 === 'function') {
-    const orig = tiktok._retrieveRoomId2;
-    tiktok._retrieveRoomId2 = async (...args) => {
-      // Optional: log once so we know it would have tried to scrape
-      try { send('debug', { stage: 'patch', note: 'override _retrieveRoomId2', argsLen: args.length }); } catch {}
-      return forceRoomInfo();
-    };
+  // Helper to hard-override both the instance and its prototype
+  function hardOverride(methodName, fn) {
+    try {
+      if (tiktok && typeof tiktok[methodName] === 'function') {
+        tiktok[methodName] = fn;
+      }
+    } catch {}
+    try {
+      const proto = tiktok && Object.getPrototypeOf(tiktok);
+      if (proto && typeof proto[methodName] === 'function') {
+        try {
+          Object.defineProperty(proto, methodName, { value: fn, writable: true });
+        } catch {
+          // fallback if defineProperty fails
+          proto[methodName] = fn;
+        }
+      }
+    } catch {}
   }
-  if (tiktok && typeof tiktok._retrieveRoomId === 'function') {
-    const orig = tiktok._retrieveRoomId;
-    tiktok._retrieveRoomId = async (...args) => {
-      try { send('debug', { stage: 'patch', note: 'override _retrieveRoomId', argsLen: args.length }); } catch {}
-      return forceRoomInfo();
-    };
-  }
+
+  // Patch both modern and legacy resolvers
+  hardOverride('_retrieveRoomId2', forceRoomInfo);
+  hardOverride('_retrieveRoomId',  forceRoomInfo);
+
+  // One-time debug so we know the patch ran
+  try { send('debug', { stage: 'patch', note: 'hardOverride room resolvers applied' }); } catch {}
 } catch {}
+
 
 // (Optional) propagate headers into internal axios instances
 try {
