@@ -348,6 +348,7 @@ app.get('/', (_req, res) => res.type('text/plain').send('TikTok SSE relay & Byli
  * - On any failure: 4xx/5xx JSON; client should treat as "hint unavailable".
  */
 // --- Byline proxy: YT uses MAIN page; sanitize; single attempt; no client fallback ------
+// --- Byline proxy: YT uses MAIN page; sanitize; single attempt; no client fallback ------
 app.get('/byline', async (req, res) => {
   try {
     setCORS(req, res); // belt & suspenders
@@ -355,86 +356,86 @@ app.get('/byline', async (req, res) => {
     let rawUrl = String(req.query.u || '').trim();
     if (!rawUrl) return res.status(400).type('text/plain').send('Missing u');
 
-    // Only known platforms
-    const ok = /^(https?:)?\/\/(?:www\.)?(youtube\.com|twitch\.tv|kick\.com)\b/i.test(rawUrl);
-    if (!ok) return res.status(400).type('text/plain').send('Unsupported host');
+    // Only known platforms (YouTube, Twitch, Kick)
+    const isKnownHost = /^(https?:)?\/\/(?:www\.)?(youtube\.com|twitch\.tv|kick\.com)\b/i.test(rawUrl);
+    if (!isKnownHost) return res.status(400).type('text/plain').send('Unsupported host'); // was const ok
 
     // Normalize and set up YouTube About → Main fallback
-const isYT = /youtube\.com/i.test(rawUrl);
-if (isYT) {
-  rawUrl = rawUrl.replace(/[?#].*$/, '').replace(/\/$/, '');
-}
+    const isYT = /youtube\.com/i.test(rawUrl);
+    if (isYT) {
+      rawUrl = rawUrl.replace(/[?#].*$/, '').replace(/\/$/, '');
+    }
 
-const rawFlag   = String(req.query.raw   || '') === '1';
-const debugFlag = String(req.query.debug || '') === '1';
+    const rawFlag   = String(req.query.raw   || '') === '1';
+    const debugFlag = String(req.query.debug || '') === '1';
 
-// Build candidate URLs: prefer About, then fallback to main channel page
-let candidates = [rawUrl];
-if (isYT) {
-  const base = rawUrl.replace(/\/about(?:$|[/?#].*)/i, '');
-  candidates = [base + '/about', base];
-}
+    // Build candidate URLs: prefer About, then fallback to main channel page
+    let candidates = [rawUrl];
+    if (isYT) {
+      const base = rawUrl.replace(/\/about(?:$|[/?#].*)/i, '');
+      candidates = [base + '/about', base];
+    }
 
-let usedUrl = null;
-let md = '';
-let ok = false;
-let lastStatus = null;
+    let usedUrl = null;
+    let md = '';
+    let fetchedOk = false;  // was "let ok = false"
+    let lastStatus = null;
 
-for (const u of candidates) {
-  const target = u.replace(/^https?:\/\//i, '');
-  const jina   = 'https://r.jina.ai/http://' + target;
+    // Try candidates until one succeeds
+    for (const u of candidates) {
+      const target = u.replace(/^https?:\/\//i, '');
+      const jina   = 'https://r.jina.ai/http://' + target;
 
-  const r = await _fetch(jina, {
-    method: 'GET',
-    redirect: 'follow',
-    headers: { 'user-agent': 'byline-proxy/1.0', 'accept-language': 'en-US,en;q=0.9' }
-  });
+      const r = await _fetch(jina, {
+        method: 'GET',
+        redirect: 'follow',
+        headers: { 'user-agent': 'byline-proxy/1.0', 'accept-language': 'en-US,en;q=0.9' }
+      });
 
-  lastStatus = r.status;
-  if (!r.ok) continue;
+      lastStatus = r.status;
+      if (!r.ok) continue;
 
-  usedUrl = u;
-  md = await r.text();
-  ok = true;
-  break;
-}
+      usedUrl = u;
+      md = await r.text();
+      fetchedOk = true;     // was "ok = true"
+      break;
+    }
 
-if (!ok) {
-  setCORS(req, res);
-  return res.status(502).type('text/plain').send('Fetch failed');
-}
+    if (!fetchedOk) {       // was "if (!ok)"
+      setCORS(req, res);
+      return res.status(502).type('text/plain').send('Fetch failed');
+    }
 
-// Return the raw Jina text for debugging when ?raw=1
-if (rawFlag) {
-  if (md.length > 400_000) md = md.slice(0, 400_000);
-  res.set('Cache-Control', 'no-store');
-  setCORS(req, res);
-  return res.type('text/plain').send(md);
-}
+    // Return the raw Jina text for debugging when ?raw=1
+    if (rawFlag) {
+      if (md.length > 400_000) md = md.slice(0, 400_000);
+      res.set('Cache-Control', 'no-store');
+      setCORS(req, res);
+      return res.type('text/plain').send(md);
+    }
 
-// Avoid huge strings causing memory spikes
-if (md.length > 400_000) md = md.slice(0, 400_000);
+    // Avoid huge strings causing memory spikes
+    if (md.length > 400_000) md = md.slice(0, 400_000);
 
-// IMPORTANT: pass the actual URL we used (About or Main) so the extractor knows
-const byline = extractBylineFor(usedUrl || rawUrl, md);
+    // IMPORTANT: pass the actual URL we used (About or Main) so the extractor knows
+    const byline = extractBylineFor(usedUrl || rawUrl, md);
 
-if (!byline) {
-  if (debugFlag) {
+    if (!byline) {
+      if (debugFlag) {
+        setCORS(req, res);
+        return res.status(200).json({
+          note: 'no-byline',
+          usedUrl: usedUrl || rawUrl,
+          length: md.length
+        });
+      }
+      setCORS(req, res);
+      return res.status(204).end();
+    }
+
+    res.set('Cache-Control', 'public, max-age=3600');
     setCORS(req, res);
-    return res.status(200).json({
-      note: 'no-byline',
-      usedUrl: usedUrl || rawUrl,
-      length: md.length
-    });
-  }
-  setCORS(req, res);
-  return res.status(204).end();
-}
-
-res.set('Cache-Control', 'public, max-age=3600');
-setCORS(req, res);
-return res.type('text/plain').send(byline);
-
+    return res.type('text/plain').send(byline);
   } catch (e) {
     console.error('byline error:', e && e.message ? e.message : e);
     setCORS(req, res);
