@@ -359,45 +359,82 @@ app.get('/byline', async (req, res) => {
     const ok = /^(https?:)?\/\/(?:www\.)?(youtube\.com|twitch\.tv|kick\.com)\b/i.test(rawUrl);
     if (!ok) return res.status(400).type('text/plain').send('Unsupported host');
 
-    // YouTube: force the About tab
-	if (/youtube\.com/i.test(rawUrl)) {
-	  // strip query/hash, trailing slash
-	  rawUrl = rawUrl.replace(/[?#].*$/, '').replace(/\/$/, '');
-	  // ensure /about is present
-	  if (!/\/about(?:$|[/?#])/.test(rawUrl)) rawUrl = rawUrl + '/about';
-	}
+    // Normalize and set up YouTube About → Main fallback
+const isYT = /youtube\.com/i.test(rawUrl);
+if (isYT) {
+  rawUrl = rawUrl.replace(/[?#].*$/, '').replace(/\/$/, '');
+}
 
-    // Fetch via r.jina.ai mirror
-    const target = rawUrl.replace(/^https?:\/\//i, '');
-    const jina   = 'https://r.jina.ai/http://' + target;
+const rawFlag   = String(req.query.raw   || '') === '1';
+const debugFlag = String(req.query.debug || '') === '1';
 
-    const r = await _fetch(jina, {
-      method: 'GET',
-      redirect: 'follow',
-      headers: { 'user-agent': 'byline-proxy/1.0', 'accept-language': 'en-US,en;q=0.9' }
-    });
+// Build candidate URLs: prefer About, then fallback to main channel page
+let candidates = [rawUrl];
+if (isYT) {
+  const base = rawUrl.replace(/\/about(?:$|[/?#].*)/i, '');
+  candidates = [base + '/about', base];
+}
 
-    if (!r.ok) {
-      // Important: include CORS headers even on error
-      setCORS(req, res);
-      return res.status(502).type('text/plain').send('Fetch failed');
-    }
+let usedUrl = null;
+let md = '';
+let ok = false;
+let lastStatus = null;
 
-    let md = await r.text();
-	
-	// Avoid huge strings causing memory spikes
-	if (md.length > 400_000) md = md.slice(0, 400_000);
+for (const u of candidates) {
+  const target = u.replace(/^https?:\/\//i, '');
+  const jina   = 'https://r.jina.ai/http://' + target;
 
-    const byline = extractBylineFor(rawUrl, md);
+  const r = await _fetch(jina, {
+    method: 'GET',
+    redirect: 'follow',
+    headers: { 'user-agent': 'byline-proxy/1.0', 'accept-language': 'en-US,en;q=0.9' }
+  });
 
-    if (!byline) {
-      setCORS(req, res);
-      return res.status(204).end();
-    }
+  lastStatus = r.status;
+  if (!r.ok) continue;
 
-    res.set('Cache-Control', 'public, max-age=3600');
+  usedUrl = u;
+  md = await r.text();
+  ok = true;
+  break;
+}
+
+if (!ok) {
+  setCORS(req, res);
+  return res.status(502).type('text/plain').send('Fetch failed');
+}
+
+// Return the raw Jina text for debugging when ?raw=1
+if (rawFlag) {
+  if (md.length > 400_000) md = md.slice(0, 400_000);
+  res.set('Cache-Control', 'no-store');
+  setCORS(req, res);
+  return res.type('text/plain').send(md);
+}
+
+// Avoid huge strings causing memory spikes
+if (md.length > 400_000) md = md.slice(0, 400_000);
+
+// IMPORTANT: pass the actual URL we used (About or Main) so the extractor knows
+const byline = extractBylineFor(usedUrl || rawUrl, md);
+
+if (!byline) {
+  if (debugFlag) {
     setCORS(req, res);
-    return res.type('text/plain').send(byline);
+    return res.status(200).json({
+      note: 'no-byline',
+      usedUrl: usedUrl || rawUrl,
+      length: md.length
+    });
+  }
+  setCORS(req, res);
+  return res.status(204).end();
+}
+
+res.set('Cache-Control', 'public, max-age=3600');
+setCORS(req, res);
+return res.type('text/plain').send(byline);
+
   } catch (e) {
     console.error('byline error:', e && e.message ? e.message : e);
     setCORS(req, res);
