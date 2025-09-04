@@ -5,8 +5,9 @@
   "type": "commonjs",
   "engines": { "node": ">=18" },
   "dependencies": {
-    "tiktok-live-connector": "^2.0.2"
-  },
+	  "express": "^4.19.2",
+	  "tiktok-live-connector": "^2.0.2"
+	},
   "scripts": {
     "prestart": "node -e \"try{console.log('[prestart] removing old tiktok-live-connector');require('fs').rmSync('node_modules/tiktok-live-connector',{recursive:true,force:true});}catch(e){console.log('[prestart] skip:',e&&e.message)}\"",
     "start": "node server.js"
