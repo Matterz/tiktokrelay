@@ -1,6 +1,6 @@
 // server.js
 const express = require('express');
-const { WebcastPushConnection } = require('@qixils/tiktok-live-connector');
+const { WebcastPushConnection } = require('tiktok-live-connector');
 
 // Debug: confirm which TikTok connector actually loads at runtime
 try {
@@ -882,17 +882,31 @@ send('debug', { stage: 'region', selected: selectedRegion, hinted: scraped.regio
 const connectorHeaders = { ...baseHeaders, Cookie: activeCookieHeader };
 
 // --- Create connector with the scraped roomId ---
+// --- Create connector (no custom Host header!) ---
 tiktok = new WebcastPushConnection(user, {
-  roomId,
-  userAgent: ua,
-  sessionId: sessionId || undefined,
-  clientParams: { room_id: roomId },
-  requestOptions: {
-    withCredentials: true,
-    headers: connectorHeaders,
-    timeout: 15000
-  }
+  // keep it simple; the lib will manage headers/cookies
+  requestPollingIntervalMs: 1000
 });
+
+// events
+tiktok.on('chat', (msg) => {
+  send('chat', { comment: String(msg.comment || ''), uniqueId: msg.uniqueId || '', nickname: msg.nickname || '' });
+});
+tiktok.on('disconnected', () => { send('status', { state: 'disconnected' }); schedule('disconnected'); });
+tiktok.on('error', (e) => { send('status', { state: 'error', error: String(e?.message || e) }); schedule('error'); });
+tiktok.on('streamEnd', () => { send('status', { state: 'ended' }); schedule('streamEnd'); });
+
+// IMPORTANT: bypass any page re-scrape by giving the known roomId
+try {
+  await tiktok.connect(String(roomId)); // connect(roomId) is supported
+  attempt = 0;
+  send('status', { state: 'connected', user, roomId, region: selectedRegion });
+  send('open',   { ok: true, user, roomId, region: selectedRegion });
+} catch (e) {
+  send('status', { state: 'error', where: 'connect', error: String(e?.message || e) });
+  schedule('connect:reject');
+}
+
 
 // --- force the connector to use the scraped roomId and skip page re-scrape ---
 try {
