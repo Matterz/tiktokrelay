@@ -876,18 +876,6 @@ tiktok.on('disconnected', () => { send('status', { state: 'disconnected' }); sch
 tiktok.on('error', (e) => { send('status', { state: 'error', error: String(e?.message || e) }); schedule('error'); });
 tiktok.on('streamEnd', () => { send('status', { state: 'ended' }); schedule('streamEnd'); });
 
-// IMPORTANT: bypass any page re-scrape by giving the known roomId
-try {
-  await tiktok.connect(String(roomId)); // connect(roomId) is supported
-  attempt = 0;
-  send('status', { state: 'connected', user, roomId, region: selectedRegion });
-  send('open',   { ok: true, user, roomId, region: selectedRegion });
-} catch (e) {
-  send('status', { state: 'error', where: 'connect', error: String(e?.message || e) });
-  schedule('connect:reject');
-}
-
-
 // --- force the connector to use the scraped roomId and skip page re-scrape ---
 try {
   const forceRoomId = String(roomId);
