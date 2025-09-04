@@ -918,6 +918,17 @@ try {
   }
 } catch {}
 
+// --- events (once) ---
+tiktok.on('chat', (msg) => {
+  send('chat', { comment: String(msg.comment || ''), uniqueId: msg.uniqueId || '', nickname: msg.nickname || '' });
+});
+const onDisc = () => { send('status', { state: 'disconnected' }); schedule('disconnected'); };
+const onErr  = (e) => { send('status', { state: 'error', error: serializeErr(e) }); schedule('error'); };
+const onEnd  = () => { send('status', { state: 'ended' }); schedule('streamEnd'); };
+tiktok.on('disconnected', onDisc);
+tiktok.on('error', onErr);
+tiktok.on('streamEnd', onEnd);
+
 // --- connect (single call, AFTER patch) ---
 try {
   await tiktok.connect(); // no arg; patch supplies {roomId,status}
@@ -928,6 +939,10 @@ try {
   send('status', { state: 'error', where: 'connect', error: serializeErr(e) });
   schedule('connect:reject');
 }
+
+connect('init');
+});
+
 
 // --- Twitch-only helpers for full About page proxy ---
 
