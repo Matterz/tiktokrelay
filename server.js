@@ -861,56 +861,48 @@ send('debug', { stage: 'region', selected: selectedRegion, hinted: scraped.regio
 // IMPORTANT: Do NOT set Host here — the connector sometimes fetches www.tiktok.com pages.
 const connectorHeaders = { ...baseHeaders, Cookie: activeCookieHeader };
 
-// --- Create connector with the scraped roomId ---
 // --- Create connector (no custom Host header!) ---
 tiktok = new WebcastPushConnection(user, {
-  // keep it simple; the lib will manage headers/cookies
-  requestPollingIntervalMs: 1000
+  requestPollingIntervalMs: 1000,
+  requestOptions: {
+    withCredentials: true,
+    headers: connectorHeaders,
+    timeout: 15000
+  }
 });
 
-// events
+// --- hard override: force known roomId, skip page re-scrape ---
+(function patchResolvers(inst){
+  const forceRoomId = String(roomId);
+  const forceRoomInfo = async () => ({ roomId: forceRoomId, status: 2 });
+
+  const patch = (obj, name) => {
+    try {
+      if (obj && typeof obj[name] === 'function') {
+        try { Object.defineProperty(obj, name, { value: forceRoomInfo, writable: true }); }
+        catch { obj[name] = forceRoomInfo; }
+      }
+    } catch {}
+  };
+  try {
+    patch(inst, '_retrieveRoomId2');
+    patch(inst, '_retrieveRoomId');
+    patch(Object.getPrototypeOf(inst), '_retrieveRoomId2');
+    patch(Object.getPrototypeOf(inst), '_retrieveRoomId');
+    send('debug', { stage: 'patch', note: 'hardOverride room resolvers applied' });
+  } catch {}
+})(tiktok);
+
+// --- events (once) ---
 tiktok.on('chat', (msg) => {
   send('chat', { comment: String(msg.comment || ''), uniqueId: msg.uniqueId || '', nickname: msg.nickname || '' });
 });
-tiktok.on('disconnected', () => { send('status', { state: 'disconnected' }); schedule('disconnected'); });
-tiktok.on('error', (e) => { send('status', { state: 'error', error: String(e?.message || e) }); schedule('error'); });
-tiktok.on('streamEnd', () => { send('status', { state: 'ended' }); schedule('streamEnd'); });
-
-// --- force the connector to use the scraped roomId and skip page re-scrape ---
-try {
-  const forceRoomId = String(roomId);
-
-  // Always return an object with { roomId, status } so the lib never reads .status from undefined
-  const forceRoomInfo = async () => ({ roomId: forceRoomId, status: 2 });
-
-  // Helper to hard-override both the instance and its prototype
-  function hardOverride(methodName, fn) {
-    try {
-      if (tiktok && typeof tiktok[methodName] === 'function') {
-        tiktok[methodName] = fn;
-      }
-    } catch {}
-    try {
-      const proto = tiktok && Object.getPrototypeOf(tiktok);
-      if (proto && typeof proto[methodName] === 'function') {
-        try {
-          Object.defineProperty(proto, methodName, { value: fn, writable: true });
-        } catch {
-          // fallback if defineProperty fails
-          proto[methodName] = fn;
-        }
-      }
-    } catch {}
-  }
-
-  // Patch both modern and legacy resolvers
-  hardOverride('_retrieveRoomId2', forceRoomInfo);
-  hardOverride('_retrieveRoomId',  forceRoomInfo);
-
-  // One-time debug so we know the patch ran
-  try { send('debug', { stage: 'patch', note: 'hardOverride room resolvers applied' }); } catch {}
-} catch {}
-
+const onDisc = () => { send('status', { state: 'disconnected' }); schedule('disconnected'); };
+const onErr  = (e) => { send('status', { state: 'error', error: serializeErr(e) }); schedule('error'); };
+const onEnd  = () => { send('status', { state: 'ended' }); schedule('streamEnd'); };
+tiktok.on('disconnected', onDisc);
+tiktok.on('error', onErr);
+tiktok.on('streamEnd', onEnd);
 
 // (Optional) propagate headers into internal axios instances
 try {
@@ -926,31 +918,16 @@ try {
   }
 } catch {}
 
-    // --- events ---
-    tiktok.on('chat', (msg) => {
-      send('chat', { comment: String(msg.comment || ''), uniqueId: msg.uniqueId || '', nickname: msg.nickname || '' });
-    });
-    const onDisc = () => { send('status', { state: 'disconnected' }); schedule('disconnected'); };
-    const onErr  = (e) => { send('status', { state: 'error', error: serializeErr(e) }); schedule('error'); };
-    const onEnd  = () => { send('status', { state: 'ended' }); schedule('streamEnd'); };
-    tiktok.on('disconnected', onDisc);
-    tiktok.on('error', onErr);
-    tiktok.on('streamEnd', onEnd);
-
-    // --- connect ---
-    try {
-      await tiktok.connect();
-      attempt = 0;
-      send('status', { state: 'connected', user, roomId, region: selectedRegion });
-      send('open',   { ok: true, user, roomId, region: selectedRegion });
-    } catch (e) {
-      send('status', { state: 'error', where: 'connect', error: serializeErr(e) });
-      schedule('connect:reject');
-    }
-  }
-
-  connect('init');
-});
+// --- connect (single call, AFTER patch) ---
+try {
+  await tiktok.connect(); // no arg; patch supplies {roomId,status}
+  attempt = 0;
+  send('status', { state: 'connected', user, roomId, region: selectedRegion });
+  send('open',   { ok: true, user, roomId, region: selectedRegion });
+} catch (e) {
+  send('status', { state: 'error', where: 'connect', error: serializeErr(e) });
+  schedule('connect:reject');
+}
 
 // --- Twitch-only helpers for full About page proxy ---
 
