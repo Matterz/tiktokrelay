@@ -857,76 +857,48 @@ app.get('/tiktok-sse', async (req, res) => {
     }
     send('debug', { stage: 'region', selected: selectedRegion, hinted: scraped.regionHint || null });
 
-    // IMPORTANT: Do NOT set Host here — the connector sometimes fetches www.tiktok.com pages.
-    const connectorHeaders = { ...baseHeaders, Cookie: activeCookieHeader };
+	// IMPORTANT: Do NOT set Host here — the connector may fetch www.tiktok.com pages.
+	const connectorHeaders = { ...baseHeaders, Cookie: activeCookieHeader };
 
-    // --- Create connector (no custom Host header!) ---
-    tiktok = new WebcastPushConnection(user, {
-      requestPollingIntervalMs: 1000,
-      requestOptions: {
-        withCredentials: true,
-        headers: connectorHeaders,
-        timeout: 15000
-      }
-    });
+	// --- Create connector (simple + supported) ---
+	tiktok = new WebcastPushConnection(user, {
+	  // Keep options minimal; let the lib manage its own HTTP unless you need to tune it
+	  requestPollingIntervalMs: 1000,
+	  requestOptions: {
+		withCredentials: true,
+		headers: connectorHeaders,
+		timeout: 15000
+	  }
+	});
 
-    // --- hard override: force known roomId, skip page re-scrape ---
-    (function patchResolvers(inst){
-      const forceRoomId = String(roomId);
-      const forceRoomInfo = async () => ({ roomId: forceRoomId, status: 2 });
+	// --- events (once) ---
+	tiktok.on('chat', (msg) => {
+	  send('chat', { comment: String(msg.comment || ''), uniqueId: msg.uniqueId || '', nickname: msg.nickname || '' });
+	});
+	const onDisc = () => { send('status', { state: 'disconnected' }); schedule('disconnected'); };
+	const onErr  = (e) => { 
+	  // nicer error message
+	  const m = (e && (e.message || e.toString && e.toString())) || String(e);
+	  send('status', { state: 'error', error: m });
+	  schedule('error');
+	};
+	const onEnd  = () => { send('status', { state: 'ended' }); schedule('streamEnd'); };
+	tiktok.on('disconnected', onDisc);
+	tiktok.on('error', onErr);
+	tiktok.on('streamEnd', onEnd);
 
-      const patch = (obj, name) => {
-        try {
-          if (obj && typeof obj[name] === 'function') {
-            try { Object.defineProperty(obj, name, { value: forceRoomInfo, writable: true }); }
-            catch { obj[name] = forceRoomInfo; }
-          }
-        } catch {}
-      };
-      try {
-        patch(inst, '_retrieveRoomId2');
-        patch(inst, '_retrieveRoomId');
-        patch(Object.getPrototypeOf(inst), '_retrieveRoomId2');
-        patch(Object.getPrototypeOf(inst), '_retrieveRoomId');
-        send('debug', { stage: 'patch', note: 'hardOverride room resolvers applied' });
-      } catch {}
-    })(tiktok);
+	// --- connect (single call; BYPASS scraping by giving roomId) ---
+	try {
+	  await tiktok.connect(String(roomId));  // <- key change
+	  attempt = 0;
+	  send('status', { state: 'connected', user, roomId, region: selectedRegion });
+	  send('open',   { ok: true, user, roomId, region: selectedRegion });
+	} catch (e) {
+	  const m = (e && (e.message || e.toString && e.toString())) || String(e);
+	  send('status', { state: 'error', where: 'connect', error: m });
+	  schedule('connect:reject');
+	}
 
-    // (Optional) propagate headers into internal axios instances
-    try {
-      if (tiktok.http?.defaults) {
-        tiktok.http.defaults.withCredentials = true;
-        tiktok.http.defaults.headers = { ...(tiktok.http.defaults.headers || {}), ...connectorHeaders };
-        if (tiktok.http.defaults.headers.common) Object.assign(tiktok.http.defaults.headers.common, connectorHeaders);
-      }
-      if (tiktok.webcastClient?.http?.defaults) {
-        tiktok.webcastClient.http.defaults.withCredentials = true;
-        tiktok.webcastClient.http.defaults.headers = { ...(tiktok.webcastClient.http.defaults.headers || {}), ...connectorHeaders };
-        if (tiktok.webcastClient.http.defaults.headers.common) Object.assign(tiktok.webcastClient.http.defaults.headers.common, connectorHeaders);
-      }
-    } catch {}
-
-    // --- events (once) ---
-    tiktok.on('chat', (msg) => {
-      send('chat', { comment: String(msg.comment || ''), uniqueId: msg.uniqueId || '', nickname: msg.nickname || '' });
-    });
-    const onDisc = () => { send('status', { state: 'disconnected' }); schedule('disconnected'); };
-    const onErr  = (e) => { send('status', { state: 'error', error: serializeErr(e) }); schedule('error'); };
-    const onEnd  = () => { send('status', { state: 'ended' }); schedule('streamEnd'); };
-    tiktok.on('disconnected', onDisc);
-    tiktok.on('error', onErr);
-    tiktok.on('streamEnd', onEnd);
-
-    // --- connect (single call, AFTER patch) ---
-    try {
-      await tiktok.connect(); // no arg; patch supplies {roomId,status}
-      attempt = 0;
-      send('status', { state: 'connected', user, roomId, region: selectedRegion });
-      send('open',   { ok: true, user, roomId, region: selectedRegion });
-    } catch (e) {
-      send('status', { state: 'error', where: 'connect', error: serializeErr(e) });
-      schedule('connect:reject');
-    }
   } // end connect()
 
   connect('init');
