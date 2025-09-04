@@ -729,7 +729,6 @@ async function getWebcastRoomStatus(roomId, headers) {
 }
 
 /* ------------------------------ TikTok SSE ------------------------------- */
-/** SSE endpoint: /tiktok-sse?user=keyaogames[&trust=1][&force=1][&region=EU|US] */
 app.get('/tiktok-sse', async (req, res) => {
   setCORS(req, res);
 
@@ -747,7 +746,7 @@ app.get('/tiktok-sse', async (req, res) => {
     try {
       res.write(`event: ${event}\n`);
       res.write(`data: ${JSON.stringify(data)}\n\n`);
-    } catch (_) { /* socket closed */ }
+    } catch (_) {}
   };
 
   const keepAlive = setInterval(() => { try { res.write(': keep-alive\n\n'); } catch (_) {} }, 15000);
@@ -780,15 +779,6 @@ app.get('/tiktok-sse', async (req, res) => {
     const referer = `https://www.tiktok.com/@${encodeURIComponent(user)}/live`;
     const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36';
 
-    function makeMsToken() {
-      const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-      let t = '';
-      for (let i = 0; i < 107; i++) t += chars[(Math.random() * chars.length) | 0];
-      return t;
-    }
-    const msToken = makeMsToken();
-    const sessionId = (process.env.TIKTOK_SESSIONID || '').trim();
-
     const baseHeaders = {
       'User-Agent': ua,
       'Referer': referer,
@@ -809,6 +799,15 @@ app.get('/tiktok-sse', async (req, res) => {
     try { extraCookie = await getTikTokCookieHeader(user, baseHeaders); } catch {}
 
     // Build cookie (US by default; may switch to EU later)
+    function makeMsToken() {
+      const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+      let t = '';
+      for (let i = 0; i < 107; i++) t += chars[(Math.random() * chars.length) | 0];
+      return t;
+    }
+    const msToken = makeMsToken();
+    const sessionId = (process.env.TIKTOK_SESSIONID || '').trim();
+
     const cookieParts = ['msToken=' + msToken, 'tt-web-region=US'];
     if (extraCookie) cookieParts.push(extraCookie);
     if (sessionId) {
@@ -847,100 +846,90 @@ app.get('/tiktok-sse', async (req, res) => {
       return schedule('scrape');
     }
 
-   // --- Region (US default; switch to EU if hinted or forced) ---
-const qpRegion = String(req.query.region || '').trim().toUpperCase();
-let selectedRegion = qpRegion || (scraped.regionHint || '').toUpperCase() || 'US';
-if (!/^(US|EU)$/.test(selectedRegion)) selectedRegion = 'US';
+    // --- Region (US default; switch to EU if hinted or forced) ---
+    const qpRegion = String(req.query.region || '').trim().toUpperCase();
+    let selectedRegion = qpRegion || (scraped.regionHint || '').toUpperCase() || 'US';
+    if (!/^(US|EU)$/.test(selectedRegion)) selectedRegion = 'US';
 
-let activeCookieHeader = cookieHeaderUS;
-if (!activeCookieHeader.includes(`tt-web-region=${selectedRegion}`)) {
-  activeCookieHeader = activeCookieHeader.replace(/tt-web-region=(US|EU)/, `tt-web-region=${selectedRegion}`);
-}
-send('debug', { stage: 'region', selected: selectedRegion, hinted: scraped.regionHint || null });
+    let activeCookieHeader = cookieHeaderUS;
+    if (!activeCookieHeader.includes(`tt-web-region=${selectedRegion}`)) {
+      activeCookieHeader = activeCookieHeader.replace(/tt-web-region=(US|EU)/, `tt-web-region=${selectedRegion}`);
+    }
+    send('debug', { stage: 'region', selected: selectedRegion, hinted: scraped.regionHint || null });
 
-// IMPORTANT: Do NOT set Host here — the connector sometimes fetches www.tiktok.com pages.
-const connectorHeaders = { ...baseHeaders, Cookie: activeCookieHeader };
+    // IMPORTANT: Do NOT set Host here — the connector sometimes fetches www.tiktok.com pages.
+    const connectorHeaders = { ...baseHeaders, Cookie: activeCookieHeader };
 
-// --- Create connector (no custom Host header!) ---
-tiktok = new WebcastPushConnection(user, {
-  requestPollingIntervalMs: 1000,
-  requestOptions: {
-    withCredentials: true,
-    headers: connectorHeaders,
-    timeout: 15000
-  }
-});
+    // --- Create connector (no custom Host header!) ---
+    tiktok = new WebcastPushConnection(user, {
+      requestPollingIntervalMs: 1000,
+      requestOptions: {
+        withCredentials: true,
+        headers: connectorHeaders,
+        timeout: 15000
+      }
+    });
 
-// --- hard override: force known roomId, skip page re-scrape ---
-(function patchResolvers(inst){
-  const forceRoomId = String(roomId);
-  const forceRoomInfo = async () => ({ roomId: forceRoomId, status: 2 });
+    // --- hard override: force known roomId, skip page re-scrape ---
+    (function patchResolvers(inst){
+      const forceRoomId = String(roomId);
+      const forceRoomInfo = async () => ({ roomId: forceRoomId, status: 2 });
 
-  const patch = (obj, name) => {
+      const patch = (obj, name) => {
+        try {
+          if (obj && typeof obj[name] === 'function') {
+            try { Object.defineProperty(obj, name, { value: forceRoomInfo, writable: true }); }
+            catch { obj[name] = forceRoomInfo; }
+          }
+        } catch {}
+      };
+      try {
+        patch(inst, '_retrieveRoomId2');
+        patch(inst, '_retrieveRoomId');
+        patch(Object.getPrototypeOf(inst), '_retrieveRoomId2');
+        patch(Object.getPrototypeOf(inst), '_retrieveRoomId');
+        send('debug', { stage: 'patch', note: 'hardOverride room resolvers applied' });
+      } catch {}
+    })(tiktok);
+
+    // (Optional) propagate headers into internal axios instances
     try {
-      if (obj && typeof obj[name] === 'function') {
-        try { Object.defineProperty(obj, name, { value: forceRoomInfo, writable: true }); }
-        catch { obj[name] = forceRoomInfo; }
+      if (tiktok.http?.defaults) {
+        tiktok.http.defaults.withCredentials = true;
+        tiktok.http.defaults.headers = { ...(tiktok.http.defaults.headers || {}), ...connectorHeaders };
+        if (tiktok.http.defaults.headers.common) Object.assign(tiktok.http.defaults.headers.common, connectorHeaders);
+      }
+      if (tiktok.webcastClient?.http?.defaults) {
+        tiktok.webcastClient.http.defaults.withCredentials = true;
+        tiktok.webcastClient.http.defaults.headers = { ...(tiktok.webcastClient.http.defaults.headers || {}), ...connectorHeaders };
+        if (tiktok.webcastClient.http.defaults.headers.common) Object.assign(tiktok.webcastClient.http.defaults.headers.common, connectorHeaders);
       }
     } catch {}
-  };
-  try {
-    patch(inst, '_retrieveRoomId2');
-    patch(inst, '_retrieveRoomId');
-    patch(Object.getPrototypeOf(inst), '_retrieveRoomId2');
-    patch(Object.getPrototypeOf(inst), '_retrieveRoomId');
-    send('debug', { stage: 'patch', note: 'hardOverride room resolvers applied' });
-  } catch {}
-})(tiktok);
 
-// --- events (once) ---
-tiktok.on('chat', (msg) => {
-  send('chat', { comment: String(msg.comment || ''), uniqueId: msg.uniqueId || '', nickname: msg.nickname || '' });
-});
-const onDisc = () => { send('status', { state: 'disconnected' }); schedule('disconnected'); };
-const onErr  = (e) => { send('status', { state: 'error', error: serializeErr(e) }); schedule('error'); };
-const onEnd  = () => { send('status', { state: 'ended' }); schedule('streamEnd'); };
-tiktok.on('disconnected', onDisc);
-tiktok.on('error', onErr);
-tiktok.on('streamEnd', onEnd);
+    // --- events (once) ---
+    tiktok.on('chat', (msg) => {
+      send('chat', { comment: String(msg.comment || ''), uniqueId: msg.uniqueId || '', nickname: msg.nickname || '' });
+    });
+    const onDisc = () => { send('status', { state: 'disconnected' }); schedule('disconnected'); };
+    const onErr  = (e) => { send('status', { state: 'error', error: serializeErr(e) }); schedule('error'); };
+    const onEnd  = () => { send('status', { state: 'ended' }); schedule('streamEnd'); };
+    tiktok.on('disconnected', onDisc);
+    tiktok.on('error', onErr);
+    tiktok.on('streamEnd', onEnd);
 
-// (Optional) propagate headers into internal axios instances
-try {
-  if (tiktok.http?.defaults) {
-    tiktok.http.defaults.withCredentials = true;
-    tiktok.http.defaults.headers = { ...(tiktok.http.defaults.headers || {}), ...connectorHeaders };
-    if (tiktok.http.defaults.headers.common) Object.assign(tiktok.http.defaults.headers.common, connectorHeaders);
-  }
-  if (tiktok.webcastClient?.http?.defaults) {
-    tiktok.webcastClient.http.defaults.withCredentials = true;
-    tiktok.webcastClient.http.defaults.headers = { ...(tiktok.webcastClient.http.defaults.headers || {}), ...connectorHeaders };
-    if (tiktok.webcastClient.http.defaults.headers.common) Object.assign(tiktok.webcastClient.http.defaults.headers.common, connectorHeaders);
-  }
-} catch {}
+    // --- connect (single call, AFTER patch) ---
+    try {
+      await tiktok.connect(); // no arg; patch supplies {roomId,status}
+      attempt = 0;
+      send('status', { state: 'connected', user, roomId, region: selectedRegion });
+      send('open',   { ok: true, user, roomId, region: selectedRegion });
+    } catch (e) {
+      send('status', { state: 'error', where: 'connect', error: serializeErr(e) });
+      schedule('connect:reject');
+    }
+  } // end connect()
 
-// --- events (once) ---
-tiktok.on('chat', (msg) => {
-  send('chat', { comment: String(msg.comment || ''), uniqueId: msg.uniqueId || '', nickname: msg.nickname || '' });
-});
-const onDisc = () => { send('status', { state: 'disconnected' }); schedule('disconnected'); };
-const onErr  = (e) => { send('status', { state: 'error', error: serializeErr(e) }); schedule('error'); };
-const onEnd  = () => { send('status', { state: 'ended' }); schedule('streamEnd'); };
-tiktok.on('disconnected', onDisc);
-tiktok.on('error', onErr);
-tiktok.on('streamEnd', onEnd);
-
-// --- connect (single call, AFTER patch) ---
-try {
-  await tiktok.connect(); // no arg; patch supplies {roomId,status}
-  attempt = 0;
-  send('status', { state: 'connected', user, roomId, region: selectedRegion });
-  send('open',   { ok: true, user, roomId, region: selectedRegion });
-} catch (e) {
-  send('status', { state: 'error', where: 'connect', error: serializeErr(e) });
-  schedule('connect:reject');
-}
-
-connect('init');
+  connect('init');
 });
 
 
