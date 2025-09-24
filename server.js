@@ -1006,6 +1006,57 @@ app.get('/debug/tiktok', async (req, res) => {
   }
 });
 
+// --- Steam reviews proxy ------------------------------------------------------
+// GET /steam-reviews?appId=570&cursor=*
+// Forwards to Steam's public appreviews API and returns (cursor, query_summary, reviews[])
+app.get('/steam-reviews', async (req, res) => {
+  try {
+    setCORS(req, res); // you already have this helper
+    const appId  = String(req.query.appId || '').trim();
+    const cursor = String(req.query.cursor || '*');
+    if (!appId) return res.status(400).json({ error: 'Missing ?appId=' });
+
+    const params = new URLSearchParams({
+      json: '1',
+      language: 'all',
+      filter: 'all',
+      num_per_page: '100',
+      purchase_type: 'all',
+      cursor
+    });
+
+    const url = `https://store.steampowered.com/appreviews/${encodeURIComponent(appId)}?${params.toString()}`;
+    const r = await _fetch(url, {
+      method: 'GET',
+      headers: { 'user-agent': 'Mozilla/5.0 (compatible; SteamGuess/1.0)' }
+    });
+
+    if (!r.ok) {
+      return res.status(r.status).json({ error: 'steam_upstream', status: r.status });
+    }
+
+    const data = await r.json();
+    res.set('Cache-Control', 'no-store');
+    // keep only the fields we actually use
+    res.json({
+      cursor: data.cursor || null,
+      query_summary: data.query_summary || null,
+      reviews: Array.isArray(data.reviews) ? data.reviews.map(rv => ({
+        review: rv.review,
+        voted_up: rv.voted_up,
+        votes_up: rv.votes_up,
+        votes_funny: rv.votes_funny,
+        timestamp_created: rv.timestamp_created,
+        author: rv.author,
+        steam_purchase: rv.steam_purchase,
+        received_for_free: rv.received_for_free
+      })) : []
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
 /* --------------------------------- Start -------------------------------- */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Relay listening on', PORT));
