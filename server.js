@@ -1008,10 +1008,9 @@ app.get('/debug/tiktok', async (req, res) => {
 
 // --- Steam reviews proxy ------------------------------------------------------
 // GET /steam-reviews?appId=570&cursor=*
-// Forwards to Steam's public appreviews API and returns (cursor, query_summary, reviews[])
 app.get('/steam-reviews', async (req, res) => {
   try {
-    setCORS(req, res); // you already have this helper
+    setCORS(req, res);
     const appId  = String(req.query.appId || '').trim();
     const cursor = String(req.query.cursor || '*');
     if (!appId) return res.status(400).json({ error: 'Missing ?appId=' });
@@ -1036,15 +1035,14 @@ app.get('/steam-reviews', async (req, res) => {
     }
 
     const data = await r.json();
-	// inside your /steam-reviews route, right after `const data = await r.json();`
-	console.log('steam-reviews', appId, {
-	  status: r.status,
-	  got: Array.isArray(data.reviews) ? data.reviews.length : -1,
-	  cursor: data.cursor
-	});
+    // helpful log to see it firing
+    console.log('steam-reviews', appId, {
+      status: r.status,
+      got: Array.isArray(data.reviews) ? data.reviews.length : -1,
+      cursor: data.cursor
+    });
 
     res.set('Cache-Control', 'no-store');
-    // keep only the fields we actually use
     res.json({
       cursor: data.cursor || null,
       query_summary: data.query_summary || null,
@@ -1063,6 +1061,7 @@ app.get('/steam-reviews', async (req, res) => {
     res.status(500).json({ error: String(e?.message || e) });
   }
 });
+
 
 /* --------------------------------- Start -------------------------------- */
 const PORT = process.env.PORT || 3000;
