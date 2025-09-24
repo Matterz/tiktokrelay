@@ -1036,6 +1036,13 @@ app.get('/steam-reviews', async (req, res) => {
     }
 
     const data = await r.json();
+	// inside your /steam-reviews route, right after `const data = await r.json();`
+	console.log('steam-reviews', appId, {
+	  status: r.status,
+	  got: Array.isArray(data.reviews) ? data.reviews.length : -1,
+	  cursor: data.cursor
+	});
+
     res.set('Cache-Control', 'no-store');
     // keep only the fields we actually use
     res.json({
